@@ -1597,16 +1597,11 @@ def figure_4(plot=False, seed=SEED, config=None):
         raise ValueError("regression_loss must be 'mse' or 'nmse'")
     run_config = copy.deepcopy(cfg)
     run_config.setdefault("training", {})["regression_loss"] = regression_loss
-    full_data = generate_synthetic_data(num_users=15, samples_per_user=max(sample_counts), seed=seed, noise_std=noise_std)
+    data_seed_rng = np.random.default_rng(seed)
+    data_seeds = [int(data_seed_rng.integers(0, 2**32 - 1)) for _ in sample_counts]
     curves = {"proposed": [], "baseline_a": [], "baseline_b": []}
-    for count in sample_counts:
-        data = {
-            "users": [TensorDataset(user_data.tensors[0][:count], user_data.tensors[1][:count]) for user_data in full_data["users"]],
-            "x": torch.cat([user_data.tensors[0][:count] for user_data in full_data["users"]]),
-            "y": torch.cat([user_data.tensors[1][:count] for user_data in full_data["users"]]),
-            "counts": [count] * 15,
-            "task": "regression",
-        }
+    for count, data_seed in zip(sample_counts, data_seeds):
+        data = generate_synthetic_data(num_users=15, samples_per_user=count, seed=data_seed, noise_std=noise_std)
         train_data = TensorDataset(data["x"], data["y"])
         torch.manual_seed(seed)
         initial_model = RegressionFNN(activation=activation)
@@ -1643,6 +1638,8 @@ def figure_4(plot=False, seed=SEED, config=None):
             "learning_rate": learning_rate,
             "loss_function": regression_loss,
             "loss_source": "training",
+            "data_sampling": "independent_per_count",
+            "data_seeds": data_seeds,
         },
     }
     if plot:
