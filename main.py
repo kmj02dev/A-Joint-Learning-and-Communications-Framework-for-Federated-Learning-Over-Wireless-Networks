@@ -1181,7 +1181,7 @@ def load_yaml(path=None):
 
 # figures
 def figure_3(plot=False, seed=7):
-    data = generate_synthetic_data(num_users=15, samples_per_user=30, seed=seed)
+    data = generate_synthetic_data(num_users=15, samples_per_user=[4] * 5 + [3] * 10, seed=seed)
     test_data = TensorDataset(data["x"], data["y"])
     result = {}
     for name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}.items():
