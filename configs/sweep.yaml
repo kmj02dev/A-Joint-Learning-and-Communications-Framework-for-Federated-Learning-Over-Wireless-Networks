@@ -28,6 +28,7 @@ training:
   # Use null to fall back to each parameter tensor's actual dtype size.
   quantization_bits: [16]
   eval_batch_size: [256]
+  regression_loss: [mse]
   regression_scale_floor: [1.0e-12]
 
 figures:
