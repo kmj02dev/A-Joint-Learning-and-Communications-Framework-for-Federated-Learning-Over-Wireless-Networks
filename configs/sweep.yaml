@@ -1,24 +1,45 @@
 # Runtime override consumed by main.py. Values under figures may be scalars
 # or lists. Lists define the experiment candidates to run from this YAML.
-seed: [42]
+seed: [0, 42, 1004]
+
+# Values below are not stated explicitly in the paper. Keep them singleton
+# lists by default so they are sweepable without expanding this baseline grid.
+wireless:
+  min_distance_m: [5.0]
+  interference_lognormal_sigma: [0.35]
+  rate_floor: [1.0e-12]
+  channel_gain_floor: [1.0e-18]
+  snr_denominator_floor: [1.0e-18]
+  power_floor_w: [1.0e-12]
+  power_solver_maxiter: [50]
+  heuristic_max_rbs: [20]
+
+training:
+  quantization_bits: [1]
+  model_bits_floor: [1024]
+  eval_batch_size: [256]
+  regression_scale_floor: [1.0e-12]
+
 figures:
   figure_3:
     # Fig. 3 does not state the exact number of red-cross regression samples.
     data_count: [50]
     test_count: [1000]
     rounds: [130]
-    num_rbs: [12]
+    num_rbs: [9]
     local_epochs: [1]
-    batch_size: [32]
+    batch_size: [50]
     activation: [identity]
     learning_rate: [0.01]
+    regression_loss: [mse, nmse]
   figure_4:
     # sample_counts is itself a list-valued parameter, so use list-of-lists.
     sample_counts:
       - [10, 20, 30, 40, 50]
     rounds: [130]
-    num_rbs: [12]
+    num_rbs: [9]
     local_epochs: [1]
-    batch_size: [32]
+    batch_size: [50]
     activation: [identity]
     learning_rate: [0.01]
+    regression_loss: [mse, nmse]

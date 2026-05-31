@@ -240,6 +240,16 @@ def baseline_a(
     seed = int(cfg["seed"] if seed is None else seed)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
+    model_bits_floor = int(train_cfg.get("model_bits_floor", 1024))
+    eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
+    regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
+    min_distance = float(wireless.get("min_distance_m", 5.0))
+    interference_sigma = float(wireless.get("interference_lognormal_sigma", 0.35))
+    rate_floor = float(wireless.get("rate_floor", 1e-12))
+    channel_gain_floor = float(wireless.get("channel_gain_floor", 1e-18))
+    snr_denominator_floor = float(wireless.get("snr_denominator_floor", 1e-18))
+    power_floor = float(wireless.get("power_floor_w", 1e-12))
+    power_solver_maxiter = int(wireless.get("power_solver_maxiter", 50))
 
     if partitions is not None:
         num_users = len(partitions)
@@ -257,17 +267,17 @@ def baseline_a(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = max(1024, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
+        model_bits = max(model_bits_floor, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
 
     radius = float(wireless["radius_m"])
-    distances = np.maximum(5.0, radius * np.sqrt(rng.random(num_users)))
+    distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
     fading = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs))
     channel_gain = fading * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
     downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=0.35, size=num_rbs)
+    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
@@ -289,32 +299,32 @@ def baseline_a(
     downlink_rates = downlink_bandwidth * np.log2(
         1.0 + bs_power * downlink_gain / (downlink_interference + downlink_bandwidth * n0_w_hz)
     )
-    downlink_delays = model_bits / np.maximum(downlink_rates, 1e-12)
+    downlink_delays = model_bits / np.maximum(downlink_rates, rate_floor)
 
     for user_idx in range(num_users):
         for rb_idx in range(num_rbs):
-            gain = max(channel_gain[user_idx, rb_idx], 1e-18)
+            gain = max(channel_gain[user_idx, rb_idx], channel_gain_floor)
             noise_plus_interference = interference[rb_idx] + uplink_bandwidth * n0_w_hz
 
             def energy_at(power):
                 rate_value = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
-                return train_energy + power * model_bits / max(rate_value, 1e-12)
+                return train_energy + power * model_bits / max(rate_value, rate_floor)
 
             if train_energy >= gamma_e:
-                power = min(pmax, 1e-12)
+                power = min(pmax, power_floor)
             elif energy_at(pmax) <= gamma_e:
                 power = pmax
             else:
-                low_power = 1e-12
+                low_power = power_floor
                 if energy_at(low_power) > gamma_e:
                     power = low_power
                 else:
-                    power = brentq(lambda value: energy_at(value) - gamma_e, low_power, pmax, maxiter=50)
+                    power = brentq(lambda value: energy_at(value) - gamma_e, low_power, pmax, maxiter=power_solver_maxiter)
 
             rate = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
-            packet_error = 1.0 - math.exp(-threshold * noise_plus_interference / max(power * gain, 1e-18))
+            packet_error = 1.0 - math.exp(-threshold * noise_plus_interference / max(power * gain, snr_denominator_floor))
             packet_error = min(1.0, max(0.0, packet_error))
-            delay = model_bits / max(rate, 1e-12)
+            delay = model_bits / max(rate, rate_floor)
             energy = energy_at(power)
 
             powers[user_idx, rb_idx] = power
@@ -361,6 +371,9 @@ def baseline_a(
         global_model = model.to(device_obj)
         loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
+        regression_loss = str(train_cfg.get("regression_loss", "mse")).lower()
+        if regression_loss not in {"mse", "nmse"}:
+            raise ValueError("training.regression_loss must be 'mse' or 'nmse'")
 
         for _ in range(int(rounds)):
             local_states = []
@@ -379,7 +392,11 @@ def baseline_a(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            loss = (prediction - target).pow(2).mean()
+                            squared_error = (prediction - target).pow(2)
+                            if regression_loss == "nmse":
+                                loss = squared_error.sum() / target.pow(2).sum().clamp_min(regression_scale_floor)
+                            else:
+                                loss = squared_error.mean()
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -398,6 +415,7 @@ def baseline_a(
 
             global_model.eval()
             eval_loss = 0.0
+            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -409,7 +427,7 @@ def baseline_a(
                         features_list.append(feature)
                         labels_list.append(label)
                 eval_source = TensorDataset(torch.cat(features_list), torch.cat(labels_list))
-            loader = DataLoader(eval_source, batch_size=256, shuffle=False)
+            loader = DataLoader(eval_source, batch_size=eval_batch_size, shuffle=False)
             with torch.no_grad():
                 for features, labels in loader:
                     features = features.to(device_obj)
@@ -418,13 +436,17 @@ def baseline_a(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
+                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_total, 1))
+            if task == "regression" and regression_loss == "nmse":
+                metrics["loss"].append(eval_loss / max(eval_scale, regression_scale_floor))
+            else:
+                metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -479,6 +501,16 @@ def baseline_b(
     seed = int(cfg["seed"] if seed is None else seed)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
+    model_bits_floor = int(train_cfg.get("model_bits_floor", 1024))
+    eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
+    regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
+    min_distance = float(wireless.get("min_distance_m", 5.0))
+    interference_sigma = float(wireless.get("interference_lognormal_sigma", 0.35))
+    rate_floor = float(wireless.get("rate_floor", 1e-12))
+    channel_gain_floor = float(wireless.get("channel_gain_floor", 1e-18))
+    snr_denominator_floor = float(wireless.get("snr_denominator_floor", 1e-18))
+    power_floor = float(wireless.get("power_floor_w", 1e-12))
+    power_solver_maxiter = int(wireless.get("power_solver_maxiter", 50))
 
     if partitions is not None:
         num_users = len(partitions)
@@ -496,17 +528,17 @@ def baseline_b(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = max(1024, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
+        model_bits = max(model_bits_floor, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
 
     radius = float(wireless["radius_m"])
-    distances = np.maximum(5.0, radius * np.sqrt(rng.random(num_users)))
+    distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
     fading = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs))
     channel_gain = fading * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
     downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=0.35, size=num_rbs)
+    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
@@ -528,32 +560,32 @@ def baseline_b(
     downlink_rates = downlink_bandwidth * np.log2(
         1.0 + bs_power * downlink_gain / (downlink_interference + downlink_bandwidth * n0_w_hz)
     )
-    downlink_delays = model_bits / np.maximum(downlink_rates, 1e-12)
+    downlink_delays = model_bits / np.maximum(downlink_rates, rate_floor)
 
     for user_idx in range(num_users):
         for rb_idx in range(num_rbs):
-            gain = max(channel_gain[user_idx, rb_idx], 1e-18)
+            gain = max(channel_gain[user_idx, rb_idx], channel_gain_floor)
             noise_plus_interference = interference[rb_idx] + uplink_bandwidth * n0_w_hz
 
             def energy_at(power):
                 rate_value = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
-                return train_energy + power * model_bits / max(rate_value, 1e-12)
+                return train_energy + power * model_bits / max(rate_value, rate_floor)
 
             if train_energy >= gamma_e:
-                power = min(pmax, 1e-12)
+                power = min(pmax, power_floor)
             elif energy_at(pmax) <= gamma_e:
                 power = pmax
             else:
-                low_power = 1e-12
+                low_power = power_floor
                 if energy_at(low_power) > gamma_e:
                     power = low_power
                 else:
-                    power = brentq(lambda value: energy_at(value) - gamma_e, low_power, pmax, maxiter=50)
+                    power = brentq(lambda value: energy_at(value) - gamma_e, low_power, pmax, maxiter=power_solver_maxiter)
 
             rate = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
-            packet_error = 1.0 - math.exp(-threshold * noise_plus_interference / max(power * gain, 1e-18))
+            packet_error = 1.0 - math.exp(-threshold * noise_plus_interference / max(power * gain, snr_denominator_floor))
             packet_error = min(1.0, max(0.0, packet_error))
-            delay = model_bits / max(rate, 1e-12)
+            delay = model_bits / max(rate, rate_floor)
             energy = energy_at(power)
 
             powers[user_idx, rb_idx] = power
@@ -591,6 +623,9 @@ def baseline_b(
         global_model = model.to(device_obj)
         loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
+        regression_loss = str(train_cfg.get("regression_loss", "mse")).lower()
+        if regression_loss not in {"mse", "nmse"}:
+            raise ValueError("training.regression_loss must be 'mse' or 'nmse'")
 
         for _ in range(int(rounds)):
             local_states = []
@@ -609,7 +644,11 @@ def baseline_b(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            loss = (prediction - target).pow(2).mean()
+                            squared_error = (prediction - target).pow(2)
+                            if regression_loss == "nmse":
+                                loss = squared_error.sum() / target.pow(2).sum().clamp_min(regression_scale_floor)
+                            else:
+                                loss = squared_error.mean()
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -628,6 +667,7 @@ def baseline_b(
 
             global_model.eval()
             eval_loss = 0.0
+            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -639,7 +679,7 @@ def baseline_b(
                         features_list.append(feature)
                         labels_list.append(label)
                 eval_source = TensorDataset(torch.cat(features_list), torch.cat(labels_list))
-            loader = DataLoader(eval_source, batch_size=256, shuffle=False)
+            loader = DataLoader(eval_source, batch_size=eval_batch_size, shuffle=False)
             with torch.no_grad():
                 for features, labels in loader:
                     features = features.to(device_obj)
@@ -648,13 +688,17 @@ def baseline_b(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
+                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_total, 1))
+            if task == "regression" and regression_loss == "nmse":
+                metrics["loss"].append(eval_loss / max(eval_scale, regression_scale_floor))
+            else:
+                metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -709,6 +753,16 @@ def baseline_c(
     seed = int(cfg["seed"] if seed is None else seed)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
+    model_bits_floor = int(train_cfg.get("model_bits_floor", 1024))
+    eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
+    regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
+    min_distance = float(wireless.get("min_distance_m", 5.0))
+    interference_sigma = float(wireless.get("interference_lognormal_sigma", 0.35))
+    rate_floor = float(wireless.get("rate_floor", 1e-12))
+    channel_gain_floor = float(wireless.get("channel_gain_floor", 1e-18))
+    snr_denominator_floor = float(wireless.get("snr_denominator_floor", 1e-18))
+    power_floor = float(wireless.get("power_floor_w", 1e-12))
+    power_solver_maxiter = int(wireless.get("power_solver_maxiter", 50))
 
     if partitions is not None:
         num_users = len(partitions)
@@ -726,17 +780,17 @@ def baseline_c(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = max(1024, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
+        model_bits = max(model_bits_floor, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
 
     radius = float(wireless["radius_m"])
-    distances = np.maximum(5.0, radius * np.sqrt(rng.random(num_users)))
+    distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
     fading = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs))
     channel_gain = fading * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
     downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=0.35, size=num_rbs)
+    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
@@ -758,32 +812,32 @@ def baseline_c(
     downlink_rates = downlink_bandwidth * np.log2(
         1.0 + bs_power * downlink_gain / (downlink_interference + downlink_bandwidth * n0_w_hz)
     )
-    downlink_delays = model_bits / np.maximum(downlink_rates, 1e-12)
+    downlink_delays = model_bits / np.maximum(downlink_rates, rate_floor)
 
     for user_idx in range(num_users):
         for rb_idx in range(num_rbs):
-            gain = max(channel_gain[user_idx, rb_idx], 1e-18)
+            gain = max(channel_gain[user_idx, rb_idx], channel_gain_floor)
             noise_plus_interference = interference[rb_idx] + uplink_bandwidth * n0_w_hz
 
             def energy_at(power):
                 rate_value = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
-                return train_energy + power * model_bits / max(rate_value, 1e-12)
+                return train_energy + power * model_bits / max(rate_value, rate_floor)
 
             if train_energy >= gamma_e:
-                power = min(pmax, 1e-12)
+                power = min(pmax, power_floor)
             elif energy_at(pmax) <= gamma_e:
                 power = pmax
             else:
-                low_power = 1e-12
+                low_power = power_floor
                 if energy_at(low_power) > gamma_e:
                     power = low_power
                 else:
-                    power = brentq(lambda value: energy_at(value) - gamma_e, low_power, pmax, maxiter=50)
+                    power = brentq(lambda value: energy_at(value) - gamma_e, low_power, pmax, maxiter=power_solver_maxiter)
 
             rate = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
-            packet_error = 1.0 - math.exp(-threshold * noise_plus_interference / max(power * gain, 1e-18))
+            packet_error = 1.0 - math.exp(-threshold * noise_plus_interference / max(power * gain, snr_denominator_floor))
             packet_error = min(1.0, max(0.0, packet_error))
-            delay = model_bits / max(rate, 1e-12)
+            delay = model_bits / max(rate, rate_floor)
             energy = energy_at(power)
 
             powers[user_idx, rb_idx] = power
@@ -823,6 +877,9 @@ def baseline_c(
         global_model = model.to(device_obj)
         loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
+        regression_loss = str(train_cfg.get("regression_loss", "mse")).lower()
+        if regression_loss not in {"mse", "nmse"}:
+            raise ValueError("training.regression_loss must be 'mse' or 'nmse'")
 
         for _ in range(int(rounds)):
             local_states = []
@@ -841,7 +898,11 @@ def baseline_c(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            loss = (prediction - target).pow(2).mean()
+                            squared_error = (prediction - target).pow(2)
+                            if regression_loss == "nmse":
+                                loss = squared_error.sum() / target.pow(2).sum().clamp_min(regression_scale_floor)
+                            else:
+                                loss = squared_error.mean()
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -860,6 +921,7 @@ def baseline_c(
 
             global_model.eval()
             eval_loss = 0.0
+            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -871,7 +933,7 @@ def baseline_c(
                         features_list.append(feature)
                         labels_list.append(label)
                 eval_source = TensorDataset(torch.cat(features_list), torch.cat(labels_list))
-            loader = DataLoader(eval_source, batch_size=256, shuffle=False)
+            loader = DataLoader(eval_source, batch_size=eval_batch_size, shuffle=False)
             with torch.no_grad():
                 for features, labels in loader:
                     features = features.to(device_obj)
@@ -880,13 +942,17 @@ def baseline_c(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
+                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_total, 1))
+            if task == "regression" and regression_loss == "nmse":
+                metrics["loss"].append(eval_loss / max(eval_scale, regression_scale_floor))
+            else:
+                metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -942,6 +1008,17 @@ def proposed_algorithm(
     seed = int(cfg["seed"] if seed is None else seed)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
+    model_bits_floor = int(train_cfg.get("model_bits_floor", 1024))
+    eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
+    regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
+    min_distance = float(wireless.get("min_distance_m", 5.0))
+    interference_sigma = float(wireless.get("interference_lognormal_sigma", 0.35))
+    rate_floor = float(wireless.get("rate_floor", 1e-12))
+    channel_gain_floor = float(wireless.get("channel_gain_floor", 1e-18))
+    snr_denominator_floor = float(wireless.get("snr_denominator_floor", 1e-18))
+    power_floor = float(wireless.get("power_floor_w", 1e-12))
+    power_solver_maxiter = int(wireless.get("power_solver_maxiter", 50))
+    heuristic_max_rbs = int(wireless.get("heuristic_max_rbs", 20))
 
     if partitions is not None:
         num_users = len(partitions)
@@ -959,17 +1036,17 @@ def proposed_algorithm(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = max(1024, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
+        model_bits = max(model_bits_floor, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
 
     radius = float(wireless["radius_m"])
-    distances = np.maximum(5.0, radius * np.sqrt(rng.random(num_users)))
+    distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
     fading = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs))
     channel_gain = fading * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
     downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=0.35, size=num_rbs)
+    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
@@ -991,32 +1068,32 @@ def proposed_algorithm(
     downlink_rates = downlink_bandwidth * np.log2(
         1.0 + bs_power * downlink_gain / (downlink_interference + downlink_bandwidth * n0_w_hz)
     )
-    downlink_delays = model_bits / np.maximum(downlink_rates, 1e-12)
+    downlink_delays = model_bits / np.maximum(downlink_rates, rate_floor)
 
     for user_idx in range(num_users):
         for rb_idx in range(num_rbs):
-            gain = max(channel_gain[user_idx, rb_idx], 1e-18)
+            gain = max(channel_gain[user_idx, rb_idx], channel_gain_floor)
             noise_plus_interference = interference[rb_idx] + uplink_bandwidth * n0_w_hz
 
             def energy_at(power):
                 rate_value = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
-                return train_energy + power * model_bits / max(rate_value, 1e-12)
+                return train_energy + power * model_bits / max(rate_value, rate_floor)
 
             if train_energy >= gamma_e:
-                power = min(pmax, 1e-12)
+                power = min(pmax, power_floor)
             elif energy_at(pmax) <= gamma_e:
                 power = pmax
             else:
-                low_power = 1e-12
+                low_power = power_floor
                 if energy_at(low_power) > gamma_e:
                     power = low_power
                 else:
-                    power = brentq(lambda value: energy_at(value) - gamma_e, low_power, pmax, maxiter=50)
+                    power = brentq(lambda value: energy_at(value) - gamma_e, low_power, pmax, maxiter=power_solver_maxiter)
 
             rate = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
-            packet_error = 1.0 - math.exp(-threshold * noise_plus_interference / max(power * gain, 1e-18))
+            packet_error = 1.0 - math.exp(-threshold * noise_plus_interference / max(power * gain, snr_denominator_floor))
             packet_error = min(1.0, max(0.0, packet_error))
-            delay = model_bits / max(rate, 1e-12)
+            delay = model_bits / max(rate, rate_floor)
             energy = energy_at(power)
 
             powers[user_idx, rb_idx] = power
@@ -1041,8 +1118,8 @@ def proposed_algorithm(
                 selected_users.append(int(row))
                 assigned_rbs.append(int(col))
     elif resource_search == "heuristic":
-        if num_rbs > 20:
-            raise ValueError("heuristic resource search supports up to 20 RBs")
+        if num_rbs > heuristic_max_rbs:
+            raise ValueError(f"heuristic resource search supports up to {heuristic_max_rbs} RBs")
         memo = {}
         choices = {}
 
@@ -1100,6 +1177,9 @@ def proposed_algorithm(
         global_model = model.to(device_obj)
         loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
+        regression_loss = str(train_cfg.get("regression_loss", "mse")).lower()
+        if regression_loss not in {"mse", "nmse"}:
+            raise ValueError("training.regression_loss must be 'mse' or 'nmse'")
 
         for _ in range(int(rounds)):
             local_states = []
@@ -1118,7 +1198,11 @@ def proposed_algorithm(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            loss = (prediction - target).pow(2).mean()
+                            squared_error = (prediction - target).pow(2)
+                            if regression_loss == "nmse":
+                                loss = squared_error.sum() / target.pow(2).sum().clamp_min(regression_scale_floor)
+                            else:
+                                loss = squared_error.mean()
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -1137,6 +1221,7 @@ def proposed_algorithm(
 
             global_model.eval()
             eval_loss = 0.0
+            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -1148,7 +1233,7 @@ def proposed_algorithm(
                         features_list.append(feature)
                         labels_list.append(label)
                 eval_source = TensorDataset(torch.cat(features_list), torch.cat(labels_list))
-            loader = DataLoader(eval_source, batch_size=256, shuffle=False)
+            loader = DataLoader(eval_source, batch_size=eval_batch_size, shuffle=False)
             with torch.no_grad():
                 for features, labels in loader:
                     features = features.to(device_obj)
@@ -1157,13 +1242,17 @@ def proposed_algorithm(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
+                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_total, 1))
+            if task == "regression" and regression_loss == "nmse":
+                metrics["loss"].append(eval_loss / max(eval_scale, regression_scale_floor))
+            else:
+                metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -1219,10 +1308,22 @@ def load_yaml(path=None):
             "energy_j": 0.003,
             "interference_w": 3e-8,
             "downlink_interference_w": 1e-10,
+            "min_distance_m": 5.0,
+            "interference_lognormal_sigma": 0.35,
+            "rate_floor": 1e-12,
+            "channel_gain_floor": 1e-18,
+            "snr_denominator_floor": 1e-18,
+            "power_floor_w": 1e-12,
+            "power_solver_maxiter": 50,
+            "heuristic_max_rbs": 20,
         },
         "training": {
             "device": "auto",
             "quantization_bits": 1,
+            "model_bits_floor": 1024,
+            "eval_batch_size": 256,
+            "regression_loss": "mse",
+            "regression_scale_floor": 1e-12,
             "regression_lr": 0.08,
             "mnist_lr": 0.08,
         },
@@ -1261,6 +1362,11 @@ def load_yaml(path=None):
                 stack.append((base[key], value))
             else:
                 base[key] = value
+    for section_name in ("wireless", "training"):
+        section = config.get(section_name, {})
+        for key, value in list(section.items()):
+            if isinstance(value, list) and len(value) == 1 and (key != "ki_cycle" or isinstance(value[0], list)):
+                section[key] = value[0]
     return config
 
 
@@ -1284,6 +1390,11 @@ def figure_3(plot=False, seed=SEED, config=None):
     batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
     activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
     learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["regression_lr"])))
+    regression_loss = str(first_candidate(figure_cfg.get("regression_loss", first_candidate(cfg["training"].get("regression_loss", "mse"))))).lower()
+    if regression_loss not in {"mse", "nmse"}:
+        raise ValueError("regression_loss must be 'mse' or 'nmse'")
+    run_config = copy.deepcopy(cfg)
+    run_config.setdefault("training", {})["regression_loss"] = regression_loss
     base_count = data_count // 15
     remainder = data_count % 15
     samples_per_user = [base_count + (1 if user_idx < remainder else 0) for user_idx in range(15)]
@@ -1302,7 +1413,7 @@ def figure_3(plot=False, seed=SEED, config=None):
             "batch_size": batch_size,
             "activation": activation,
             "learning_rate": learning_rate,
-            "loss_function": "mse",
+            "loss_function": regression_loss,
             "optimal_resource_search": "heuristic",
         }
     }
@@ -1318,7 +1429,7 @@ def figure_3(plot=False, seed=SEED, config=None):
         learning_rate=learning_rate,
         resource_search="heuristic",
         seed=seed,
-        config=config,
+        config=run_config,
     )
     result["optimal"] = {
         "loss": optimal["metrics"]["loss"][-1],
@@ -1338,7 +1449,7 @@ def figure_3(plot=False, seed=SEED, config=None):
             batch_size=batch_size,
             learning_rate=learning_rate,
             seed=seed,
-            config=config,
+            config=run_config,
         )
         result[name] = {"loss": output["metrics"]["loss"][-1], "selected": len(output["selected_users"]), "model_state": output["model_state"]}
 
@@ -1396,6 +1507,11 @@ def figure_4(plot=False, seed=SEED, config=None):
     batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
     activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
     learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["regression_lr"])))
+    regression_loss = str(first_candidate(figure_cfg.get("regression_loss", first_candidate(cfg["training"].get("regression_loss", "mse"))))).lower()
+    if regression_loss not in {"mse", "nmse"}:
+        raise ValueError("regression_loss must be 'mse' or 'nmse'")
+    run_config = copy.deepcopy(cfg)
+    run_config.setdefault("training", {})["regression_loss"] = regression_loss
     full_data = generate_synthetic_data(num_users=15, samples_per_user=max(sample_counts), seed=seed)
     curves = {"proposed": [], "baseline_a": [], "baseline_b": []}
     for count in sample_counts:
@@ -1425,7 +1541,7 @@ def figure_4(plot=False, seed=SEED, config=None):
                     batch_size=batch_size,
                     learning_rate=learning_rate,
                     seed=seed,
-                    config=config,
+                    config=run_config,
                 )["metrics"]["loss"][-1]
             )
     result = {
@@ -1439,7 +1555,7 @@ def figure_4(plot=False, seed=SEED, config=None):
             "batch_size": batch_size,
             "activation": activation,
             "learning_rate": learning_rate,
-            "loss_function": "mse",
+            "loss_function": regression_loss,
             "loss_source": "training",
         },
     }
@@ -1697,7 +1813,9 @@ def main():
     def candidate_values(key, value):
         if not isinstance(value, list):
             return [value]
-        if key == "sample_counts" and (not value or not isinstance(value[0], list)):
+        if key.endswith("sample_counts") and (not value or not isinstance(value[0], list)):
+            return [value]
+        if key.endswith("ki_cycle") and (not value or not isinstance(value[0], list)):
             return [value]
         if not value:
             raise ValueError(f"{key} must not be an empty list")
@@ -1713,6 +1831,24 @@ def main():
             filename_settings = {"seed": int(seed_value)} if isinstance(seed_source, list) else {}
             varied = {"seed": int(seed_value)} if len(seed_values) > 1 else {}
             run_values.append(({}, varied, filename_settings, int(seed_value)))
+        for section_name in ("wireless", "training"):
+            section_config = config.get(section_name, {})
+            for key, value in section_config.items():
+                composite_key = f"{section_name}.{key}"
+                values = candidate_values(composite_key, value)
+                next_run_values = []
+                for existing, varied, filename_settings, seed_value in run_values:
+                    for candidate in values:
+                        updated = dict(existing)
+                        updated[composite_key] = candidate
+                        updated_varied = dict(varied)
+                        if len(values) > 1:
+                            updated_varied[composite_key] = candidate
+                        updated_filename_settings = dict(filename_settings)
+                        if len(values) > 1:
+                            updated_filename_settings[composite_key] = candidate
+                        next_run_values.append((updated, updated_varied, updated_filename_settings, seed_value))
+                run_values = next_run_values
         for key, value in figure_config.items():
             values = candidate_values(key, value)
             next_run_values = []
@@ -1733,7 +1869,14 @@ def main():
         for values, varied, filename_settings, seed_value in run_values:
             run_config = copy.deepcopy(config)
             run_config.setdefault("figures", {}).setdefault(figure_key, {})
-            run_config["figures"][figure_key].update(values)
+            figure_values = {}
+            for key, value in values.items():
+                if "." in key:
+                    section_name, section_key = key.split(".", 1)
+                    run_config.setdefault(section_name, {})[section_key] = value
+                else:
+                    figure_values[key] = value
+            run_config["figures"][figure_key].update(figure_values)
             run_config["seed"] = seed_value
             runs.append((run_config, varied, filename_settings))
         return runs or [(copy.deepcopy(config), {}, {})]
@@ -1747,10 +1890,14 @@ def main():
         token = "".join(char if char.isalnum() else "_" for char in raw).strip("_")
         return token or "value"
 
+    def key_token(key):
+        token = "".join(char if char.isalnum() else "_" for char in str(key)).strip("_")
+        return token or "key"
+
     def run_token(varied):
         if not varied:
             return "default"
-        return "_".join(f"{key}_{value_token(value)}" for key, value in varied.items())
+        return "_".join(f"{key_token(key)}_{value_token(value)}" for key, value in varied.items())
 
     def format_figure(fig, name):
         for ax in fig.axes:
