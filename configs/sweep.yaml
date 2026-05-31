@@ -5,10 +5,17 @@ seed: [0, 42, 1004]
 # Values below are not stated explicitly in the paper. Keep only those values
 # sweepable; paper-fixed parameters remain in main.py defaults.
 wireless:
-  interference_w: [3.0e-8]
-  downlink_interference_w: [1.0e-10]
-  min_distance_m: [5.0]
-  interference_lognormal_sigma: [0.35]
+  interference_w: [3e-8]
+  # RB-specific uplink interference vectors from mzchen0/Wireless-FL FLMIN.m.
+  # The original R=9 and R=12 vectors contain a negative first value; clamp it to zero.
+  interference_w_by_rbs:
+    3: [1.0e-8, 6.0e-8, 1.0e-7]
+    6: [1.0e-8, 3.0e-8, 5.0e-8, 7.0e-8, 9.0e-8, 1.1e-7]
+    9: [0.0, 2.0e-8, 3.0e-8, 4.0e-8, 6.0e-8, 7.0e-8, 8.0e-8, 1.0e-7, 1.1e-7]
+    12: [0.0, 1.0e-8, 2.0e-8, 3.0e-8, 4.0e-8, 5.0e-8, 6.0e-8, 7.0e-8, 8.0e-8, 9.0e-8, 1.0e-7, 1.1e-7]
+  downlink_interference_w: [1.8e-7]
+  min_distance_m: [0.0]
+  interference_lognormal_sigma: [0.0]
   rate_floor: [1.0e-12]
   channel_gain_floor: [1.0e-18]
   snr_denominator_floor: [1.0e-18]
@@ -17,9 +24,9 @@ wireless:
   heuristic_max_rbs: [20]
 
 training:
-  # Not specified by the paper; controls transmitted Z(w) when simulating quantized models.
+  # FLMIN.m uses Z = 39760 * 16 bits for the MNIST FNN model.
   # Use null to fall back to each parameter tensor's actual dtype size.
-  quantization_bits: [32]
+  quantization_bits: [16]
   eval_batch_size: [256]
   regression_scale_floor: [1.0e-12]
 

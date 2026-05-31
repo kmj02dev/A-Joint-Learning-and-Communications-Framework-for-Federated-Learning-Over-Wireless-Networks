@@ -280,11 +280,20 @@ def baseline_a(
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference_w = float(wireless["interference_w"])
-    if interference_w <= 0.0:
-        interference = np.zeros(num_rbs, dtype=np.float64)
+    interference_by_rbs = wireless.get("interference_w_by_rbs", {})
+    interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
+    if interference_profile is None and isinstance(interference_by_rbs, dict):
+        interference_profile = interference_by_rbs.get(num_rbs)
+    if interference_profile is not None:
+        interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
+        if interference.size != num_rbs:
+            raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
     else:
-        interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
+        interference_w = float(wireless["interference_w"])
+        if interference_w <= 0.0:
+            interference = np.zeros(num_rbs, dtype=np.float64)
+        else:
+            interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
@@ -548,11 +557,20 @@ def baseline_b(
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference_w = float(wireless["interference_w"])
-    if interference_w <= 0.0:
-        interference = np.zeros(num_rbs, dtype=np.float64)
+    interference_by_rbs = wireless.get("interference_w_by_rbs", {})
+    interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
+    if interference_profile is None and isinstance(interference_by_rbs, dict):
+        interference_profile = interference_by_rbs.get(num_rbs)
+    if interference_profile is not None:
+        interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
+        if interference.size != num_rbs:
+            raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
     else:
-        interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
+        interference_w = float(wireless["interference_w"])
+        if interference_w <= 0.0:
+            interference = np.zeros(num_rbs, dtype=np.float64)
+        else:
+            interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
@@ -807,11 +825,20 @@ def baseline_c(
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference_w = float(wireless["interference_w"])
-    if interference_w <= 0.0:
-        interference = np.zeros(num_rbs, dtype=np.float64)
+    interference_by_rbs = wireless.get("interference_w_by_rbs", {})
+    interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
+    if interference_profile is None and isinstance(interference_by_rbs, dict):
+        interference_profile = interference_by_rbs.get(num_rbs)
+    if interference_profile is not None:
+        interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
+        if interference.size != num_rbs:
+            raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
     else:
-        interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
+        interference_w = float(wireless["interference_w"])
+        if interference_w <= 0.0:
+            interference = np.zeros(num_rbs, dtype=np.float64)
+        else:
+            interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
@@ -1070,11 +1097,20 @@ def proposed_algorithm(
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference_w = float(wireless["interference_w"])
-    if interference_w <= 0.0:
-        interference = np.zeros(num_rbs, dtype=np.float64)
+    interference_by_rbs = wireless.get("interference_w_by_rbs", {})
+    interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
+    if interference_profile is None and isinstance(interference_by_rbs, dict):
+        interference_profile = interference_by_rbs.get(num_rbs)
+    if interference_profile is not None:
+        interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
+        if interference.size != num_rbs:
+            raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
     else:
-        interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
+        interference_w = float(wireless["interference_w"])
+        if interference_w <= 0.0:
+            interference = np.zeros(num_rbs, dtype=np.float64)
+        else:
+            interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
@@ -1335,9 +1371,10 @@ def load_yaml(path=None):
             "delay_s": 0.5,
             "energy_j": 0.003,
             "interference_w": 3e-8,
-            "downlink_interference_w": 1e-10,
-            "min_distance_m": 5.0,
-            "interference_lognormal_sigma": 0.35,
+            "interference_w_by_rbs": {},
+            "downlink_interference_w": 1.8e-7,
+            "min_distance_m": 0.0,
+            "interference_lognormal_sigma": 0.0,
             "rate_floor": 1e-12,
             "channel_gain_floor": 1e-18,
             "snr_denominator_floor": 1e-18,
@@ -1347,7 +1384,7 @@ def load_yaml(path=None):
         },
         "training": {
             "device": "auto",
-            "quantization_bits": None,
+            "quantization_bits": 16,
             "eval_batch_size": 256,
             "regression_loss": "nmse",
             "regression_scale_floor": 1e-12,
