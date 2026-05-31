@@ -203,16 +203,702 @@ class MNISTCNN(nn.Module):
 
 
 # FL algorithms
-def baseline_a(*args, **kwargs):
-    """Optimal user selection under a random RB allocation baseline."""
-    kwargs["scheme"] = "baseline_a"
-    return proposed_algorithm(*args, **kwargs)
+def baseline_a(
+    partitions=None,
+    model=None,
+    task="regression",
+    test_data=None,
+    num_users=15,
+    num_rbs=12,
+    config=None,
+    rounds=0,
+    local_epochs=1,
+    batch_size=32,
+    seed=None,
+    device=None,
+    learning_rate=None,
+    model_bits=None,
+):
+    """Baseline a): FL-aware user selection with random RB allocation."""
+    cfg = load_yaml() if config is None else config
+    wireless = cfg["wireless"]
+    train_cfg = cfg["training"]
+    seed = int(cfg["seed"] if seed is None else seed)
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+
+    if partitions is not None:
+        num_users = len(partitions)
+    counts = np.array(
+        [
+            len(partitions[i]) if partitions is not None else wireless["ki_cycle"][i % len(wireless["ki_cycle"])]
+            for i in range(num_users)
+        ],
+        dtype=np.float64,
+    )
+    counts = np.maximum(counts, 1.0)
+
+    if model is None:
+        model = RegressionFNN() if task == "regression" else MNISTFNN()
+    if isinstance(model, type):
+        model = model()
+    if model_bits is None:
+        model_bits = max(1024, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
+
+    radius = float(wireless["radius_m"])
+    distances = np.maximum(5.0, radius * np.sqrt(rng.random(num_users)))
+    fading = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs))
+    channel_gain = fading * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+    downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
+    n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
+    uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
+    downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
+    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=0.35, size=num_rbs)
+    downlink_interference = float(wireless["downlink_interference_w"])
+    bs_power = float(wireless["bs_power_w"])
+    pmax = float(wireless["pmax_w"])
+    gamma_t = float(wireless["delay_s"])
+    gamma_e = float(wireless["energy_j"])
+    zeta = float(wireless["energy_coefficient"])
+    omega = float(wireless["cpu_cycles_per_bit"])
+    cpu = float(wireless["cpu_frequency_hz"])
+    threshold = float(wireless["waterfall_threshold"])
+
+    powers = np.zeros((num_users, num_rbs), dtype=np.float64)
+    packet_errors = np.ones((num_users, num_rbs), dtype=np.float64)
+    uplink_rates = np.zeros((num_users, num_rbs), dtype=np.float64)
+    uplink_delays = np.full((num_users, num_rbs), np.inf, dtype=np.float64)
+    total_delays = np.full((num_users, num_rbs), np.inf, dtype=np.float64)
+    energies = np.full((num_users, num_rbs), np.inf, dtype=np.float64)
+    feasible = np.zeros((num_users, num_rbs), dtype=bool)
+    train_energy = zeta * omega * cpu ** 2 * model_bits
+    downlink_rates = downlink_bandwidth * np.log2(
+        1.0 + bs_power * downlink_gain / (downlink_interference + downlink_bandwidth * n0_w_hz)
+    )
+    downlink_delays = model_bits / np.maximum(downlink_rates, 1e-12)
+
+    for user_idx in range(num_users):
+        for rb_idx in range(num_rbs):
+            gain = max(channel_gain[user_idx, rb_idx], 1e-18)
+            noise_plus_interference = interference[rb_idx] + uplink_bandwidth * n0_w_hz
+
+            def energy_at(power):
+                rate_value = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
+                return train_energy + power * model_bits / max(rate_value, 1e-12)
+
+            if train_energy >= gamma_e:
+                power = min(pmax, 1e-12)
+            elif energy_at(pmax) <= gamma_e:
+                power = pmax
+            else:
+                low_power = 1e-12
+                if energy_at(low_power) > gamma_e:
+                    power = low_power
+                else:
+                    power = brentq(lambda value: energy_at(value) - gamma_e, low_power, pmax, maxiter=50)
+
+            rate = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
+            packet_error = 1.0 - math.exp(-threshold * noise_plus_interference / max(power * gain, 1e-18))
+            packet_error = min(1.0, max(0.0, packet_error))
+            delay = model_bits / max(rate, 1e-12)
+            energy = energy_at(power)
+
+            powers[user_idx, rb_idx] = power
+            packet_errors[user_idx, rb_idx] = packet_error
+            uplink_rates[user_idx, rb_idx] = rate
+            uplink_delays[user_idx, rb_idx] = delay
+            total_delays[user_idx, rb_idx] = delay + downlink_delays[user_idx]
+            energies[user_idx, rb_idx] = energy
+            feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
+
+    allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
+    selected_users = []
+    assigned_rbs = []
+    remaining_users = set(range(num_users))
+    for rb_idx in rng.permutation(num_rbs):
+        candidates = [user_idx for user_idx in remaining_users if feasible[user_idx, rb_idx]]
+        if not candidates:
+            continue
+        scores = counts[candidates] * (1.0 - packet_errors[candidates, rb_idx])
+        best_position = int(np.argmax(scores))
+        if scores[best_position] <= 0.0:
+            continue
+        user_idx = int(candidates[best_position])
+        allocation[user_idx, rb_idx] = 1
+        selected_users.append(user_idx)
+        assigned_rbs.append(int(rb_idx))
+        remaining_users.remove(user_idx)
+
+    solver_iterations = int(num_users * num_rbs)
+    selected_users = np.array(selected_users, dtype=np.int64)
+    assigned_rbs = np.array(assigned_rbs, dtype=np.int64)
+    selected_errors = np.array(
+        [packet_errors[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64
+    )
+    selected_powers = np.array([powers[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64)
+
+    metrics = {"loss": [], "accuracy": [], "successful_users": []}
+    trained_state = None
+    if rounds > 0 and partitions is not None:
+        device_name = device or train_cfg["device"]
+        if device_name == "auto":
+            device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        device_obj = torch.device(device_name)
+        global_model = model.to(device_obj)
+        loss_fn = nn.MSELoss() if task == "regression" else nn.CrossEntropyLoss()
+        lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
+
+        for _ in range(int(rounds)):
+            local_states = []
+            local_weights = []
+            successes = 0
+            for user_idx, rb_idx, packet_error in zip(selected_users, assigned_rbs, selected_errors):
+                local_model = copy.deepcopy(global_model).to(device_obj)
+                local_model.train()
+                optimizer = torch.optim.SGD(local_model.parameters(), lr=lr)
+                loader = DataLoader(partitions[int(user_idx)], batch_size=min(batch_size, len(partitions[int(user_idx)])), shuffle=True)
+                for _local_epoch in range(int(local_epochs)):
+                    for features, labels in loader:
+                        features = features.to(device_obj)
+                        labels = labels.to(device_obj)
+                        optimizer.zero_grad()
+                        prediction = local_model(features)
+                        if task == "regression":
+                            loss = loss_fn(prediction, labels.float().reshape_as(prediction))
+                        else:
+                            loss = loss_fn(prediction, labels.long())
+                        loss.backward()
+                        optimizer.step()
+                if rng.random() > packet_error:
+                    local_states.append({name: value.detach().cpu() for name, value in local_model.state_dict().items()})
+                    local_weights.append(float(len(partitions[int(user_idx)])))
+                    successes += 1
+
+            if local_states:
+                total_weight = sum(local_weights)
+                averaged = {}
+                for name in local_states[0]:
+                    averaged[name] = sum(state[name] * (weight / total_weight) for state, weight in zip(local_states, local_weights))
+                global_model.load_state_dict(averaged)
+
+            global_model.eval()
+            eval_loss = 0.0
+            eval_correct = 0
+            eval_total = 0
+            eval_source = test_data
+            if eval_source is None:
+                features_list = []
+                labels_list = []
+                for user_data in partitions:
+                    for feature, label in DataLoader(user_data, batch_size=len(user_data), shuffle=False):
+                        features_list.append(feature)
+                        labels_list.append(label)
+                eval_source = TensorDataset(torch.cat(features_list), torch.cat(labels_list))
+            loader = DataLoader(eval_source, batch_size=256, shuffle=False)
+            with torch.no_grad():
+                for features, labels in loader:
+                    features = features.to(device_obj)
+                    labels = labels.to(device_obj)
+                    prediction = global_model(features)
+                    if task == "regression":
+                        loss = loss_fn(prediction, labels.float().reshape_as(prediction))
+                        eval_loss += float(loss.item()) * len(features)
+                        eval_total += len(features)
+                    else:
+                        loss = loss_fn(prediction, labels.long())
+                        eval_loss += float(loss.item()) * len(features)
+                        eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
+                        eval_total += len(features)
+            metrics["loss"].append(eval_loss / max(eval_total, 1))
+            metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
+            metrics["successful_users"].append(successes)
+        trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
+
+    return {
+        "scheme": "baseline_a",
+        "allocation": allocation,
+        "selected_users": selected_users,
+        "assigned_rbs": assigned_rbs,
+        "powers": powers,
+        "selected_powers": selected_powers,
+        "packet_errors": packet_errors,
+        "selected_packet_errors": selected_errors,
+        "feasible": feasible,
+        "uplink_rates": uplink_rates,
+        "total_delays": total_delays,
+        "energies": energies,
+        "model_bits": model_bits,
+        "counts": counts,
+        "solver_iterations": solver_iterations,
+        "metrics": metrics,
+        "model_state": trained_state,
+        "wireless": {
+            "distances": distances,
+            "channel_gain": channel_gain,
+            "interference": interference,
+            "downlink_rates": downlink_rates,
+        },
+    }
 
 
-def baseline_b(*args, **kwargs):
-    """Random user selection and random RB allocation baseline."""
-    kwargs["scheme"] = "baseline_b"
-    return proposed_algorithm(*args, **kwargs)
+def baseline_b(
+    partitions=None,
+    model=None,
+    task="regression",
+    test_data=None,
+    num_users=15,
+    num_rbs=12,
+    config=None,
+    rounds=0,
+    local_epochs=1,
+    batch_size=32,
+    seed=None,
+    device=None,
+    learning_rate=None,
+    model_bits=None,
+):
+    """Baseline b): random user selection and random RB allocation."""
+    cfg = load_yaml() if config is None else config
+    wireless = cfg["wireless"]
+    train_cfg = cfg["training"]
+    seed = int(cfg["seed"] if seed is None else seed)
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+
+    if partitions is not None:
+        num_users = len(partitions)
+    counts = np.array(
+        [
+            len(partitions[i]) if partitions is not None else wireless["ki_cycle"][i % len(wireless["ki_cycle"])]
+            for i in range(num_users)
+        ],
+        dtype=np.float64,
+    )
+    counts = np.maximum(counts, 1.0)
+
+    if model is None:
+        model = RegressionFNN() if task == "regression" else MNISTFNN()
+    if isinstance(model, type):
+        model = model()
+    if model_bits is None:
+        model_bits = max(1024, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
+
+    radius = float(wireless["radius_m"])
+    distances = np.maximum(5.0, radius * np.sqrt(rng.random(num_users)))
+    fading = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs))
+    channel_gain = fading * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+    downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
+    n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
+    uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
+    downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
+    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=0.35, size=num_rbs)
+    downlink_interference = float(wireless["downlink_interference_w"])
+    bs_power = float(wireless["bs_power_w"])
+    pmax = float(wireless["pmax_w"])
+    gamma_t = float(wireless["delay_s"])
+    gamma_e = float(wireless["energy_j"])
+    zeta = float(wireless["energy_coefficient"])
+    omega = float(wireless["cpu_cycles_per_bit"])
+    cpu = float(wireless["cpu_frequency_hz"])
+    threshold = float(wireless["waterfall_threshold"])
+
+    powers = np.zeros((num_users, num_rbs), dtype=np.float64)
+    packet_errors = np.ones((num_users, num_rbs), dtype=np.float64)
+    uplink_rates = np.zeros((num_users, num_rbs), dtype=np.float64)
+    uplink_delays = np.full((num_users, num_rbs), np.inf, dtype=np.float64)
+    total_delays = np.full((num_users, num_rbs), np.inf, dtype=np.float64)
+    energies = np.full((num_users, num_rbs), np.inf, dtype=np.float64)
+    feasible = np.zeros((num_users, num_rbs), dtype=bool)
+    train_energy = zeta * omega * cpu ** 2 * model_bits
+    downlink_rates = downlink_bandwidth * np.log2(
+        1.0 + bs_power * downlink_gain / (downlink_interference + downlink_bandwidth * n0_w_hz)
+    )
+    downlink_delays = model_bits / np.maximum(downlink_rates, 1e-12)
+
+    for user_idx in range(num_users):
+        for rb_idx in range(num_rbs):
+            gain = max(channel_gain[user_idx, rb_idx], 1e-18)
+            noise_plus_interference = interference[rb_idx] + uplink_bandwidth * n0_w_hz
+
+            def energy_at(power):
+                rate_value = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
+                return train_energy + power * model_bits / max(rate_value, 1e-12)
+
+            if train_energy >= gamma_e:
+                power = min(pmax, 1e-12)
+            elif energy_at(pmax) <= gamma_e:
+                power = pmax
+            else:
+                low_power = 1e-12
+                if energy_at(low_power) > gamma_e:
+                    power = low_power
+                else:
+                    power = brentq(lambda value: energy_at(value) - gamma_e, low_power, pmax, maxiter=50)
+
+            rate = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
+            packet_error = 1.0 - math.exp(-threshold * noise_plus_interference / max(power * gain, 1e-18))
+            packet_error = min(1.0, max(0.0, packet_error))
+            delay = model_bits / max(rate, 1e-12)
+            energy = energy_at(power)
+
+            powers[user_idx, rb_idx] = power
+            packet_errors[user_idx, rb_idx] = packet_error
+            uplink_rates[user_idx, rb_idx] = rate
+            uplink_delays[user_idx, rb_idx] = delay
+            total_delays[user_idx, rb_idx] = delay + downlink_delays[user_idx]
+            energies[user_idx, rb_idx] = energy
+            feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
+
+    allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
+    selected_users = []
+    assigned_rbs = []
+    for user_idx, rb_idx in zip(rng.permutation(num_users), rng.permutation(num_rbs)):
+        if feasible[user_idx, rb_idx]:
+            allocation[user_idx, rb_idx] = 1
+            selected_users.append(int(user_idx))
+            assigned_rbs.append(int(rb_idx))
+
+    solver_iterations = int(num_users * num_rbs)
+    selected_users = np.array(selected_users, dtype=np.int64)
+    assigned_rbs = np.array(assigned_rbs, dtype=np.int64)
+    selected_errors = np.array(
+        [packet_errors[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64
+    )
+    selected_powers = np.array([powers[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64)
+
+    metrics = {"loss": [], "accuracy": [], "successful_users": []}
+    trained_state = None
+    if rounds > 0 and partitions is not None:
+        device_name = device or train_cfg["device"]
+        if device_name == "auto":
+            device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        device_obj = torch.device(device_name)
+        global_model = model.to(device_obj)
+        loss_fn = nn.MSELoss() if task == "regression" else nn.CrossEntropyLoss()
+        lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
+
+        for _ in range(int(rounds)):
+            local_states = []
+            local_weights = []
+            successes = 0
+            for user_idx, rb_idx, packet_error in zip(selected_users, assigned_rbs, selected_errors):
+                local_model = copy.deepcopy(global_model).to(device_obj)
+                local_model.train()
+                optimizer = torch.optim.SGD(local_model.parameters(), lr=lr)
+                loader = DataLoader(partitions[int(user_idx)], batch_size=min(batch_size, len(partitions[int(user_idx)])), shuffle=True)
+                for _local_epoch in range(int(local_epochs)):
+                    for features, labels in loader:
+                        features = features.to(device_obj)
+                        labels = labels.to(device_obj)
+                        optimizer.zero_grad()
+                        prediction = local_model(features)
+                        if task == "regression":
+                            loss = loss_fn(prediction, labels.float().reshape_as(prediction))
+                        else:
+                            loss = loss_fn(prediction, labels.long())
+                        loss.backward()
+                        optimizer.step()
+                if rng.random() > packet_error:
+                    local_states.append({name: value.detach().cpu() for name, value in local_model.state_dict().items()})
+                    local_weights.append(float(len(partitions[int(user_idx)])))
+                    successes += 1
+
+            if local_states:
+                total_weight = sum(local_weights)
+                averaged = {}
+                for name in local_states[0]:
+                    averaged[name] = sum(state[name] * (weight / total_weight) for state, weight in zip(local_states, local_weights))
+                global_model.load_state_dict(averaged)
+
+            global_model.eval()
+            eval_loss = 0.0
+            eval_correct = 0
+            eval_total = 0
+            eval_source = test_data
+            if eval_source is None:
+                features_list = []
+                labels_list = []
+                for user_data in partitions:
+                    for feature, label in DataLoader(user_data, batch_size=len(user_data), shuffle=False):
+                        features_list.append(feature)
+                        labels_list.append(label)
+                eval_source = TensorDataset(torch.cat(features_list), torch.cat(labels_list))
+            loader = DataLoader(eval_source, batch_size=256, shuffle=False)
+            with torch.no_grad():
+                for features, labels in loader:
+                    features = features.to(device_obj)
+                    labels = labels.to(device_obj)
+                    prediction = global_model(features)
+                    if task == "regression":
+                        loss = loss_fn(prediction, labels.float().reshape_as(prediction))
+                        eval_loss += float(loss.item()) * len(features)
+                        eval_total += len(features)
+                    else:
+                        loss = loss_fn(prediction, labels.long())
+                        eval_loss += float(loss.item()) * len(features)
+                        eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
+                        eval_total += len(features)
+            metrics["loss"].append(eval_loss / max(eval_total, 1))
+            metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
+            metrics["successful_users"].append(successes)
+        trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
+
+    return {
+        "scheme": "baseline_b",
+        "allocation": allocation,
+        "selected_users": selected_users,
+        "assigned_rbs": assigned_rbs,
+        "powers": powers,
+        "selected_powers": selected_powers,
+        "packet_errors": packet_errors,
+        "selected_packet_errors": selected_errors,
+        "feasible": feasible,
+        "uplink_rates": uplink_rates,
+        "total_delays": total_delays,
+        "energies": energies,
+        "model_bits": model_bits,
+        "counts": counts,
+        "solver_iterations": solver_iterations,
+        "metrics": metrics,
+        "model_state": trained_state,
+        "wireless": {
+            "distances": distances,
+            "channel_gain": channel_gain,
+            "interference": interference,
+            "downlink_rates": downlink_rates,
+        },
+    }
+
+
+def baseline_c(
+    partitions=None,
+    model=None,
+    task="regression",
+    test_data=None,
+    num_users=15,
+    num_rbs=12,
+    config=None,
+    rounds=0,
+    local_epochs=1,
+    batch_size=32,
+    seed=None,
+    device=None,
+    learning_rate=None,
+    model_bits=None,
+):
+    """Baseline c): wireless-only optimization that ignores FL parameters."""
+    cfg = load_yaml() if config is None else config
+    wireless = cfg["wireless"]
+    train_cfg = cfg["training"]
+    seed = int(cfg["seed"] if seed is None else seed)
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+
+    if partitions is not None:
+        num_users = len(partitions)
+    counts = np.array(
+        [
+            len(partitions[i]) if partitions is not None else wireless["ki_cycle"][i % len(wireless["ki_cycle"])]
+            for i in range(num_users)
+        ],
+        dtype=np.float64,
+    )
+    counts = np.maximum(counts, 1.0)
+
+    if model is None:
+        model = RegressionFNN() if task == "regression" else MNISTFNN()
+    if isinstance(model, type):
+        model = model()
+    if model_bits is None:
+        model_bits = max(1024, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
+
+    radius = float(wireless["radius_m"])
+    distances = np.maximum(5.0, radius * np.sqrt(rng.random(num_users)))
+    fading = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs))
+    channel_gain = fading * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+    downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
+    n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
+    uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
+    downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
+    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=0.35, size=num_rbs)
+    downlink_interference = float(wireless["downlink_interference_w"])
+    bs_power = float(wireless["bs_power_w"])
+    pmax = float(wireless["pmax_w"])
+    gamma_t = float(wireless["delay_s"])
+    gamma_e = float(wireless["energy_j"])
+    zeta = float(wireless["energy_coefficient"])
+    omega = float(wireless["cpu_cycles_per_bit"])
+    cpu = float(wireless["cpu_frequency_hz"])
+    threshold = float(wireless["waterfall_threshold"])
+
+    powers = np.zeros((num_users, num_rbs), dtype=np.float64)
+    packet_errors = np.ones((num_users, num_rbs), dtype=np.float64)
+    uplink_rates = np.zeros((num_users, num_rbs), dtype=np.float64)
+    uplink_delays = np.full((num_users, num_rbs), np.inf, dtype=np.float64)
+    total_delays = np.full((num_users, num_rbs), np.inf, dtype=np.float64)
+    energies = np.full((num_users, num_rbs), np.inf, dtype=np.float64)
+    feasible = np.zeros((num_users, num_rbs), dtype=bool)
+    train_energy = zeta * omega * cpu ** 2 * model_bits
+    downlink_rates = downlink_bandwidth * np.log2(
+        1.0 + bs_power * downlink_gain / (downlink_interference + downlink_bandwidth * n0_w_hz)
+    )
+    downlink_delays = model_bits / np.maximum(downlink_rates, 1e-12)
+
+    for user_idx in range(num_users):
+        for rb_idx in range(num_rbs):
+            gain = max(channel_gain[user_idx, rb_idx], 1e-18)
+            noise_plus_interference = interference[rb_idx] + uplink_bandwidth * n0_w_hz
+
+            def energy_at(power):
+                rate_value = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
+                return train_energy + power * model_bits / max(rate_value, 1e-12)
+
+            if train_energy >= gamma_e:
+                power = min(pmax, 1e-12)
+            elif energy_at(pmax) <= gamma_e:
+                power = pmax
+            else:
+                low_power = 1e-12
+                if energy_at(low_power) > gamma_e:
+                    power = low_power
+                else:
+                    power = brentq(lambda value: energy_at(value) - gamma_e, low_power, pmax, maxiter=50)
+
+            rate = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
+            packet_error = 1.0 - math.exp(-threshold * noise_plus_interference / max(power * gain, 1e-18))
+            packet_error = min(1.0, max(0.0, packet_error))
+            delay = model_bits / max(rate, 1e-12)
+            energy = energy_at(power)
+
+            powers[user_idx, rb_idx] = power
+            packet_errors[user_idx, rb_idx] = packet_error
+            uplink_rates[user_idx, rb_idx] = rate
+            uplink_delays[user_idx, rb_idx] = delay
+            total_delays[user_idx, rb_idx] = delay + downlink_delays[user_idx]
+            energies[user_idx, rb_idx] = energy
+            feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
+
+    weights = np.where(feasible, packet_errors - 1.0, 0.0)
+    allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
+    selected_users = []
+    assigned_rbs = []
+    rows, cols = linear_sum_assignment(weights)
+    for row, col in zip(rows, cols):
+        if feasible[row, col] and weights[row, col] < 0.0:
+            allocation[row, col] = 1
+            selected_users.append(int(row))
+            assigned_rbs.append(int(col))
+
+    solver_iterations = int(num_users * num_rbs)
+    selected_users = np.array(selected_users, dtype=np.int64)
+    assigned_rbs = np.array(assigned_rbs, dtype=np.int64)
+    selected_errors = np.array(
+        [packet_errors[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64
+    )
+    selected_powers = np.array([powers[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64)
+
+    metrics = {"loss": [], "accuracy": [], "successful_users": []}
+    trained_state = None
+    if rounds > 0 and partitions is not None:
+        device_name = device or train_cfg["device"]
+        if device_name == "auto":
+            device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        device_obj = torch.device(device_name)
+        global_model = model.to(device_obj)
+        loss_fn = nn.MSELoss() if task == "regression" else nn.CrossEntropyLoss()
+        lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
+
+        for _ in range(int(rounds)):
+            local_states = []
+            local_weights = []
+            successes = 0
+            for user_idx, rb_idx, packet_error in zip(selected_users, assigned_rbs, selected_errors):
+                local_model = copy.deepcopy(global_model).to(device_obj)
+                local_model.train()
+                optimizer = torch.optim.SGD(local_model.parameters(), lr=lr)
+                loader = DataLoader(partitions[int(user_idx)], batch_size=min(batch_size, len(partitions[int(user_idx)])), shuffle=True)
+                for _local_epoch in range(int(local_epochs)):
+                    for features, labels in loader:
+                        features = features.to(device_obj)
+                        labels = labels.to(device_obj)
+                        optimizer.zero_grad()
+                        prediction = local_model(features)
+                        if task == "regression":
+                            loss = loss_fn(prediction, labels.float().reshape_as(prediction))
+                        else:
+                            loss = loss_fn(prediction, labels.long())
+                        loss.backward()
+                        optimizer.step()
+                if rng.random() > packet_error:
+                    local_states.append({name: value.detach().cpu() for name, value in local_model.state_dict().items()})
+                    local_weights.append(float(len(partitions[int(user_idx)])))
+                    successes += 1
+
+            if local_states:
+                total_weight = sum(local_weights)
+                averaged = {}
+                for name in local_states[0]:
+                    averaged[name] = sum(state[name] * (weight / total_weight) for state, weight in zip(local_states, local_weights))
+                global_model.load_state_dict(averaged)
+
+            global_model.eval()
+            eval_loss = 0.0
+            eval_correct = 0
+            eval_total = 0
+            eval_source = test_data
+            if eval_source is None:
+                features_list = []
+                labels_list = []
+                for user_data in partitions:
+                    for feature, label in DataLoader(user_data, batch_size=len(user_data), shuffle=False):
+                        features_list.append(feature)
+                        labels_list.append(label)
+                eval_source = TensorDataset(torch.cat(features_list), torch.cat(labels_list))
+            loader = DataLoader(eval_source, batch_size=256, shuffle=False)
+            with torch.no_grad():
+                for features, labels in loader:
+                    features = features.to(device_obj)
+                    labels = labels.to(device_obj)
+                    prediction = global_model(features)
+                    if task == "regression":
+                        loss = loss_fn(prediction, labels.float().reshape_as(prediction))
+                        eval_loss += float(loss.item()) * len(features)
+                        eval_total += len(features)
+                    else:
+                        loss = loss_fn(prediction, labels.long())
+                        eval_loss += float(loss.item()) * len(features)
+                        eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
+                        eval_total += len(features)
+            metrics["loss"].append(eval_loss / max(eval_total, 1))
+            metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
+            metrics["successful_users"].append(successes)
+        trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
+
+    return {
+        "scheme": "baseline_c",
+        "allocation": allocation,
+        "selected_users": selected_users,
+        "assigned_rbs": assigned_rbs,
+        "powers": powers,
+        "selected_powers": selected_powers,
+        "packet_errors": packet_errors,
+        "selected_packet_errors": selected_errors,
+        "feasible": feasible,
+        "uplink_rates": uplink_rates,
+        "total_delays": total_delays,
+        "energies": energies,
+        "model_bits": model_bits,
+        "counts": counts,
+        "solver_iterations": solver_iterations,
+        "metrics": metrics,
+        "model_state": trained_state,
+        "wireless": {
+            "distances": distances,
+            "channel_gain": channel_gain,
+            "interference": interference,
+            "downlink_rates": downlink_rates,
+        },
+    }
 
 
 def proposed_algorithm(
@@ -226,7 +912,6 @@ def proposed_algorithm(
     rounds=0,
     local_epochs=1,
     batch_size=32,
-    scheme="proposed",
     seed=None,
     device=None,
     learning_rate=None,
@@ -324,36 +1009,17 @@ def proposed_algorithm(
             energies[user_idx, rb_idx] = energy
             feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
 
-    if scheme == "wireless":
-        weights = np.where(feasible, packet_errors - 1.0, 0.0)
-    else:
-        weights = np.where(feasible, counts[:, None] * (packet_errors - 1.0), 0.0)
-
+    weights = np.where(feasible, counts[:, None] * (packet_errors - 1.0), 0.0)
     allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
     selected_users = []
     assigned_rbs = []
     solver_iterations = int(num_users * num_rbs)
-    if scheme in {"proposed", "wireless"}:
-        rows, cols = linear_sum_assignment(weights)
-        for row, col in zip(rows, cols):
-            if feasible[row, col] and weights[row, col] < 0.0:
-                allocation[row, col] = 1
-                selected_users.append(int(row))
-                assigned_rbs.append(int(col))
-    elif scheme == "baseline_a":
-        for user_idx, rb_idx in zip(rng.permutation(num_users), rng.permutation(num_rbs)):
-            if feasible[user_idx, rb_idx]:
-                allocation[user_idx, rb_idx] = 1
-                selected_users.append(int(user_idx))
-                assigned_rbs.append(int(rb_idx))
-    elif scheme == "baseline_b":
-        for user_idx, rb_idx in zip(rng.permutation(num_users), rng.permutation(num_rbs)):
-            if feasible[user_idx, rb_idx] and rng.random() > packet_errors[user_idx, rb_idx]:
-                allocation[user_idx, rb_idx] = 1
-                selected_users.append(int(user_idx))
-                assigned_rbs.append(int(rb_idx))
-    else:
-        raise ValueError(f"unknown scheme: {scheme}")
+    rows, cols = linear_sum_assignment(weights)
+    for row, col in zip(rows, cols):
+        if feasible[row, col] and weights[row, col] < 0.0:
+            allocation[row, col] = 1
+            selected_users.append(int(row))
+            assigned_rbs.append(int(col))
 
     selected_users = np.array(selected_users, dtype=np.int64)
     assigned_rbs = np.array(assigned_rbs, dtype=np.int64)
@@ -440,7 +1106,7 @@ def proposed_algorithm(
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
 
     return {
-        "scheme": scheme,
+        "scheme": "proposed",
         "allocation": allocation,
         "selected_users": selected_users,
         "assigned_rbs": assigned_rbs,
@@ -664,11 +1330,9 @@ def figure_6(plot=False, seed=7):
 def figure_7(plot=False, seed=7, rounds=130):
     data = load_mnist_data(num_users=15, samples_per_user=[240, 200, 160, 80, 40] * 3, test_samples=1000, seed=seed)
     curves = {}
-    for name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}.items():
+    for name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b, "baseline_c": baseline_c}.items():
         output = runner(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=rounds, num_rbs=12, seed=seed, batch_size=32)
         curves[name] = output["metrics"]["accuracy"]
-    wireless = proposed_algorithm(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=rounds, num_rbs=12, seed=seed, batch_size=32, scheme="wireless")
-    curves["baseline_c"] = wireless["metrics"]["accuracy"]
     result = {"rounds": list(range(1, rounds + 1)), "accuracy": curves}
     if plot:
         fig, ax = plt.subplots()
@@ -701,7 +1365,7 @@ def figure_8(plot=False, seed=7):
             baseline_b(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed)["metrics"]["accuracy"][-1]
         )
         curves["baseline_c"].append(
-            proposed_algorithm(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed, scheme="wireless")["metrics"]["accuracy"][-1]
+            baseline_c(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed)["metrics"]["accuracy"][-1]
         )
     result = {"users": user_counts, "accuracy": curves}
     if plot:
@@ -736,7 +1400,7 @@ def figure_9(plot=False, seed=7):
             baseline_b(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed)["metrics"]["accuracy"][-1]
         )
         curves["baseline_c"].append(
-            proposed_algorithm(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed, scheme="wireless")["metrics"]["accuracy"][-1]
+            baseline_c(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed)["metrics"]["accuracy"][-1]
         )
     result = {"rbs": rb_counts, "accuracy": curves}
     if plot:
@@ -797,7 +1461,7 @@ def figure_10(plot=False, seed=7):
 # main
 def main():
     parser = argparse.ArgumentParser(description="Reproduce FL over wireless network experiments from Chen et al. TWC 2021.")
-    parser.add_argument("--figure", choices=["smoke", "3", "4", "5", "6", "7", "8", "9", "10", "all"], default="smoke")
+    parser.add_argument("--figure", choices=["3", "4", "5", "6", "7", "8", "9", "10", "all"], default="all")
     parser.add_argument("--config", default=None)
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--output-dir", default="outputs")
@@ -816,14 +1480,6 @@ def main():
             "legend.framealpha": 1.0,
         }
     )
-
-    if args.figure == "smoke":
-        data = generate_synthetic_data(num_users=15, samples_per_user=30, seed=args.seed)
-        output = proposed_algorithm(data["users"], RegressionFNN, task="regression", test_data=TensorDataset(data["x"], data["y"]), rounds=20, config=config, seed=args.seed)
-        print("smoke: proposed wireless-aware FL")
-        print(f"selected_users={len(output['selected_users'])}, mean_packet_error={np.mean(output['selected_packet_errors']) if len(output['selected_packet_errors']) else float('nan'):.4f}")
-        print(f"final_regression_loss={output['metrics']['loss'][-1]:.6f}")
-        return
 
     calls = {
         "3": figure_3,

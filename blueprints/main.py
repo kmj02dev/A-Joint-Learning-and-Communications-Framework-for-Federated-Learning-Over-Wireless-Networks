@@ -28,6 +28,9 @@ def baseline_a():
 def baseline_b():
     pass
 
+def baseline_c():
+    pass
+
 def proposed_algorithm():
     pass
 
