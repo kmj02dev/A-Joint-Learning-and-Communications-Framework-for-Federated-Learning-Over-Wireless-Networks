@@ -266,7 +266,11 @@ def baseline_a(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
+        quantization_bits = train_cfg.get("quantization_bits")
+        if quantization_bits is None:
+            model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
+        else:
+            model_bits = int(sum(parameter.numel() for parameter in model.parameters()) * int(quantization_bits))
 
     radius = float(wireless["radius_m"])
     distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
@@ -526,7 +530,11 @@ def baseline_b(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
+        quantization_bits = train_cfg.get("quantization_bits")
+        if quantization_bits is None:
+            model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
+        else:
+            model_bits = int(sum(parameter.numel() for parameter in model.parameters()) * int(quantization_bits))
 
     radius = float(wireless["radius_m"])
     distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
@@ -777,7 +785,11 @@ def baseline_c(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
+        quantization_bits = train_cfg.get("quantization_bits")
+        if quantization_bits is None:
+            model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
+        else:
+            model_bits = int(sum(parameter.numel() for parameter in model.parameters()) * int(quantization_bits))
 
     radius = float(wireless["radius_m"])
     distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
@@ -1032,7 +1044,11 @@ def proposed_algorithm(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
+        quantization_bits = train_cfg.get("quantization_bits")
+        if quantization_bits is None:
+            model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
+        else:
+            model_bits = int(sum(parameter.numel() for parameter in model.parameters()) * int(quantization_bits))
 
     radius = float(wireless["radius_m"])
     distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
@@ -1315,6 +1331,7 @@ def load_yaml(path=None):
         },
         "training": {
             "device": "auto",
+            "quantization_bits": None,
             "eval_batch_size": 256,
             "regression_loss": "nmse",
             "regression_scale_floor": 1e-12,

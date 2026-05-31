@@ -17,6 +17,9 @@ wireless:
   heuristic_max_rbs: [20]
 
 training:
+  # Not specified by the paper; controls transmitted Z(w) when simulating quantized models.
+  # Use null to fall back to each parameter tensor's actual dtype size.
+  quantization_bits: [32]
   eval_batch_size: [256]
   regression_scale_floor: [1.0e-12]
 
