@@ -280,7 +280,11 @@ def baseline_a(
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=interference_sigma, size=num_rbs)
+    interference_w = float(wireless["interference_w"])
+    if interference_w <= 0.0:
+        interference = np.zeros(num_rbs, dtype=np.float64)
+    else:
+        interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
@@ -544,7 +548,11 @@ def baseline_b(
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=interference_sigma, size=num_rbs)
+    interference_w = float(wireless["interference_w"])
+    if interference_w <= 0.0:
+        interference = np.zeros(num_rbs, dtype=np.float64)
+    else:
+        interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
@@ -799,7 +807,11 @@ def baseline_c(
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=interference_sigma, size=num_rbs)
+    interference_w = float(wireless["interference_w"])
+    if interference_w <= 0.0:
+        interference = np.zeros(num_rbs, dtype=np.float64)
+    else:
+        interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
@@ -1058,7 +1070,11 @@ def proposed_algorithm(
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference = rng.lognormal(mean=math.log(float(wireless["interference_w"])), sigma=interference_sigma, size=num_rbs)
+    interference_w = float(wireless["interference_w"])
+    if interference_w <= 0.0:
+        interference = np.zeros(num_rbs, dtype=np.float64)
+    else:
+        interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
     downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
