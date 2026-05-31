@@ -351,29 +351,30 @@ def baseline_a(
             energies[user_idx, rb_idx] = energy
             feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
 
+    weights = np.where(feasible, counts[:, None] * (packet_errors - 1.0), 0.0)
+    assignment_users = []
+    rows, cols = linear_sum_assignment(weights)
+    for row, col in zip(rows, cols):
+        if feasible[row, col] and weights[row, col] < 0.0:
+            assignment_users.append(int(row))
+
     allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
     selected_users = []
     assigned_rbs = []
-    remaining_users = set(range(num_users))
-    for rb_idx in rng.permutation(num_rbs):
-        candidates = [user_idx for user_idx in remaining_users if feasible[user_idx, rb_idx]]
-        if not candidates:
-            continue
-        scores = counts[candidates] * (1.0 - packet_errors[candidates, rb_idx])
-        best_position = int(np.argmax(scores))
-        if scores[best_position] <= 0.0:
-            continue
-        user_idx = int(candidates[best_position])
+    random_rbs = rng.permutation(num_rbs)[:len(assignment_users)]
+    for user_idx, rb_idx in zip(assignment_users, random_rbs):
         allocation[user_idx, rb_idx] = 1
         selected_users.append(user_idx)
         assigned_rbs.append(int(rb_idx))
-        remaining_users.remove(user_idx)
-
     solver_iterations = int(num_users * num_rbs)
     selected_users = np.array(selected_users, dtype=np.int64)
     assigned_rbs = np.array(assigned_rbs, dtype=np.int64)
     selected_errors = np.array(
-        [packet_errors[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64
+        [
+            packet_errors[user_idx, rb_idx] if feasible[user_idx, rb_idx] else 1.0
+            for user_idx, rb_idx in zip(selected_users, assigned_rbs)
+        ],
+        dtype=np.float64,
     )
     selected_powers = np.array([powers[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64)
 
@@ -633,20 +634,23 @@ def baseline_b(
             energies[user_idx, rb_idx] = energy
             feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
 
+    if num_rbs < num_users:
+        selected_users = rng.choice(num_users, size=num_rbs, replace=False).astype(np.int64)
+    else:
+        selected_users = np.arange(num_users, dtype=np.int64)
+    assigned_rbs = rng.permutation(num_rbs)[:len(selected_users)].astype(np.int64)
     allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
-    selected_users = []
-    assigned_rbs = []
-    for user_idx, rb_idx in zip(rng.permutation(num_users), rng.permutation(num_rbs)):
-        if feasible[user_idx, rb_idx]:
-            allocation[user_idx, rb_idx] = 1
-            selected_users.append(int(user_idx))
-            assigned_rbs.append(int(rb_idx))
-
+    for user_idx, rb_idx in zip(selected_users, assigned_rbs):
+        allocation[user_idx, rb_idx] = 1
     solver_iterations = int(num_users * num_rbs)
     selected_users = np.array(selected_users, dtype=np.int64)
     assigned_rbs = np.array(assigned_rbs, dtype=np.int64)
     selected_errors = np.array(
-        [packet_errors[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64
+        [
+            packet_errors[user_idx, rb_idx] if feasible[user_idx, rb_idx] else 1.0
+            for user_idx, rb_idx in zip(selected_users, assigned_rbs)
+        ],
+        dtype=np.float64,
     )
     selected_powers = np.array([powers[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64)
 
@@ -1406,7 +1410,7 @@ def load_yaml(path=None):
             "device": "auto",
             "quantization_bits": 16,
             "eval_batch_size": 256,
-            "regression_loss": "mse",
+            "regression_loss": "nmse",
             "regression_scale_floor": 1e-12,
             "regression_lr": 0.08,
             "mnist_lr": 0.08,
