@@ -50,4 +50,5 @@ figures:
     local_epochs: [1]
     batch_size: [50]
     activation: [identity]
+    noise_std: [0.0]
     learning_rate: [0.01]

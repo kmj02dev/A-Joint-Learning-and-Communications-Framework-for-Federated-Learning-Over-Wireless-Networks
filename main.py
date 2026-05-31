@@ -1570,13 +1570,14 @@ def figure_4(plot=False, seed=SEED, config=None):
     local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
     batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
     activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
+    noise_std = float(first_candidate(figure_cfg.get("noise_std", 0.4)))
     learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["regression_lr"])))
     regression_loss = str(first_candidate(figure_cfg.get("regression_loss", first_candidate(cfg["training"].get("regression_loss", "mse"))))).lower()
     if regression_loss not in {"mse", "nmse"}:
         raise ValueError("regression_loss must be 'mse' or 'nmse'")
     run_config = copy.deepcopy(cfg)
     run_config.setdefault("training", {})["regression_loss"] = regression_loss
-    full_data = generate_synthetic_data(num_users=15, samples_per_user=max(sample_counts), seed=seed)
+    full_data = generate_synthetic_data(num_users=15, samples_per_user=max(sample_counts), seed=seed, noise_std=noise_std)
     curves = {"proposed": [], "baseline_a": [], "baseline_b": []}
     for count in sample_counts:
         data = {
@@ -1618,6 +1619,7 @@ def figure_4(plot=False, seed=SEED, config=None):
             "local_epochs": local_epochs,
             "batch_size": batch_size,
             "activation": activation,
+            "noise_std": noise_std,
             "learning_rate": learning_rate,
             "loss_function": regression_loss,
             "loss_source": "training",
