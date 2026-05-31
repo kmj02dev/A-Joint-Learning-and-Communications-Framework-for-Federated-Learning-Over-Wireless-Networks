@@ -1247,7 +1247,6 @@ def load_yaml(path=None):
             },
             "figure_4": {
                 "sample_counts": [10, 20, 30, 40, 50],
-                "test_count": 1000,
                 "rounds": 60,
                 "num_rbs": 12,
                 "local_epochs": 1,
@@ -1398,17 +1397,12 @@ def figure_4(plot=False, seed=SEED, config=None):
     sample_counts = [int(value) for value in sample_counts_raw]
     if not sample_counts:
         raise ValueError("figure_4.sample_counts must not be empty")
-    test_count = int(first_candidate(figure_cfg.get("test_count", 1000)))
     rounds = int(first_candidate(figure_cfg.get("rounds", 60)))
     num_rbs = int(first_candidate(figure_cfg.get("num_rbs", 12)))
     local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
     batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
     activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
     learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["regression_lr"])))
-    rng = np.random.default_rng(seed)
-    test_x = np.linspace(0.0, 1.0, test_count, dtype=np.float32).reshape(-1, 1)
-    test_y = -2.0 * test_x + 1.0 + 0.4 * rng.standard_normal((test_count, 1)).astype(np.float32)
-    test_data = TensorDataset(torch.from_numpy(test_x), torch.from_numpy(test_y.astype(np.float32)))
     full_data = generate_synthetic_data(num_users=15, samples_per_user=max(sample_counts), seed=seed)
     curves = {"proposed": [], "baseline_a": [], "baseline_b": []}
     for count in sample_counts:
@@ -1419,63 +1413,40 @@ def figure_4(plot=False, seed=SEED, config=None):
             "counts": [count] * 15,
             "task": "regression",
         }
-        curves["proposed"].append(
-            proposed_algorithm(
-                data["users"],
-                RegressionFNN(activation=activation),
-                task="regression",
-                test_data=test_data,
-                rounds=rounds,
-                num_rbs=num_rbs,
-                local_epochs=local_epochs,
-                batch_size=batch_size,
-                learning_rate=learning_rate,
-                seed=seed,
-                config=config,
-            )["metrics"]["loss"][-1]
-        )
-        curves["baseline_a"].append(
-            baseline_a(
-                data["users"],
-                RegressionFNN(activation=activation),
-                task="regression",
-                test_data=test_data,
-                rounds=rounds,
-                num_rbs=num_rbs,
-                local_epochs=local_epochs,
-                batch_size=batch_size,
-                learning_rate=learning_rate,
-                seed=seed,
-                config=config,
-            )["metrics"]["loss"][-1]
-        )
-        curves["baseline_b"].append(
-            baseline_b(
-                data["users"],
-                RegressionFNN(activation=activation),
-                task="regression",
-                test_data=test_data,
-                rounds=rounds,
-                num_rbs=num_rbs,
-                local_epochs=local_epochs,
-                batch_size=batch_size,
-                learning_rate=learning_rate,
-                seed=seed,
-                config=config,
-            )["metrics"]["loss"][-1]
-        )
+        train_data = TensorDataset(data["x"], data["y"])
+        torch.manual_seed(seed)
+        initial_model = RegressionFNN(activation=activation)
+        initial_state = {name: value.detach().clone() for name, value in initial_model.state_dict().items()}
+        for curve_name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}.items():
+            model_instance = RegressionFNN(activation=activation)
+            model_instance.load_state_dict(copy.deepcopy(initial_state))
+            curves[curve_name].append(
+                runner(
+                    data["users"],
+                    model_instance,
+                    task="regression",
+                    test_data=train_data,
+                    rounds=rounds,
+                    num_rbs=num_rbs,
+                    local_epochs=local_epochs,
+                    batch_size=batch_size,
+                    learning_rate=learning_rate,
+                    seed=seed,
+                    config=config,
+                )["metrics"]["loss"][-1]
+            )
     result = {
         "samples_per_user": sample_counts,
         "loss": curves,
         "hyperparameters": {
             "sample_counts": sample_counts,
-            "test_count": test_count,
             "rounds": rounds,
             "num_rbs": num_rbs,
             "local_epochs": local_epochs,
             "batch_size": batch_size,
             "activation": activation,
             "learning_rate": learning_rate,
+            "loss_source": "training",
         },
     }
     if plot:
