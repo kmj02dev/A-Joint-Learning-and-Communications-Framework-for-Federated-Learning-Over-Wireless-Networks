@@ -1594,7 +1594,7 @@ def figure_4(plot=False, seed=SEED, config=None):
     local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
     batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
     activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
-    noise_std = float(first_candidate(figure_cfg.get("noise_std", 0.4)))
+    noise_std = 0.4
     learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["regression_lr"])))
     regression_loss = str(first_candidate(figure_cfg.get("regression_loss", first_candidate(cfg["training"].get("regression_loss", "mse"))))).lower()
     if regression_loss not in {"mse", "nmse"}:
