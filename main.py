@@ -1322,7 +1322,7 @@ def load_yaml(path=None):
             "quantization_bits": 1,
             "model_bits_floor": 1024,
             "eval_batch_size": 256,
-            "regression_loss": "mse",
+            "regression_loss": "nmse",
             "regression_scale_floor": 1e-12,
             "regression_lr": 0.08,
             "mnist_lr": 0.08,
