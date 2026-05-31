@@ -1162,6 +1162,11 @@ def load_yaml(path=None):
             "regression_lr": 0.08,
             "mnist_lr": 0.08,
         },
+        "figures": {
+            "figure_3": {
+                "data_count": 50,
+            },
+        },
     }
     if path is None:
         return config
@@ -1180,12 +1185,17 @@ def load_yaml(path=None):
 
 
 # figures
-def figure_3(plot=False, seed=7):
-    data = generate_synthetic_data(num_users=15, samples_per_user=[4] * 5 + [3] * 10, seed=seed)
+def figure_3(plot=False, seed=7, config=None):
+    cfg = load_yaml() if config is None else config
+    data_count = int(cfg.get("figures", {}).get("figure_3", {}).get("data_count", 50))
+    base_count = data_count // 15
+    remainder = data_count % 15
+    samples_per_user = [base_count + (1 if user_idx < remainder else 0) for user_idx in range(15)]
+    data = generate_synthetic_data(num_users=15, samples_per_user=samples_per_user, seed=seed)
     test_data = TensorDataset(data["x"], data["y"])
     result = {}
     for name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}.items():
-        output = runner(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=80, num_rbs=12, seed=seed)
+        output = runner(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=80, num_rbs=12, seed=seed, config=config)
         result[name] = {"loss": output["metrics"]["loss"][-1], "selected": len(output["selected_users"]), "model_state": output["model_state"]}
 
     ideal = RegressionFNN()
@@ -1231,20 +1241,20 @@ def figure_3(plot=False, seed=7):
     return result
 
 
-def figure_4(plot=False, seed=7):
+def figure_4(plot=False, seed=7, config=None):
     sample_counts = [10, 20, 30, 40, 50]
     curves = {"proposed": [], "baseline_a": [], "baseline_b": []}
     for count in sample_counts:
         data = generate_synthetic_data(num_users=15, samples_per_user=count, seed=seed)
         test_data = TensorDataset(data["x"], data["y"])
         curves["proposed"].append(
-            proposed_algorithm(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=60, num_rbs=12, seed=seed)["metrics"]["loss"][-1]
+            proposed_algorithm(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=60, num_rbs=12, seed=seed, config=config)["metrics"]["loss"][-1]
         )
         curves["baseline_a"].append(
-            baseline_a(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=60, num_rbs=12, seed=seed)["metrics"]["loss"][-1]
+            baseline_a(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=60, num_rbs=12, seed=seed, config=config)["metrics"]["loss"][-1]
         )
         curves["baseline_b"].append(
-            baseline_b(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=60, num_rbs=12, seed=seed)["metrics"]["loss"][-1]
+            baseline_b(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=60, num_rbs=12, seed=seed, config=config)["metrics"]["loss"][-1]
         )
     result = {"samples_per_user": sample_counts, "loss": curves}
     if plot:
@@ -1265,14 +1275,14 @@ def figure_4(plot=False, seed=7):
     return result
 
 
-def figure_5(plot=False, seed=7):
+def figure_5(plot=False, seed=7, config=None):
     users = [3, 6, 10, 15, 20, 25]
     curves = {10: [], 15: []}
     timings = {10: [], 15: []}
     for rb_count in curves:
         for user_count in users:
             started = time.perf_counter()
-            output = proposed_algorithm(num_users=user_count, num_rbs=rb_count, seed=seed)
+            output = proposed_algorithm(num_users=user_count, num_rbs=rb_count, seed=seed, config=config)
             timings[rb_count].append(time.perf_counter() - started)
             curves[rb_count].append(output["solver_iterations"])
     result = {"users": users, "edge_weight_evaluations": curves, "seconds": timings}
@@ -1288,12 +1298,12 @@ def figure_5(plot=False, seed=7):
     return result
 
 
-def figure_6(plot=False, seed=7):
+def figure_6(plot=False, seed=7, config=None):
     users = [3, 6, 9, 12, 15, 18]
     theoretical = []
     simulated = []
     for user_count in users:
-        output = proposed_algorithm(num_users=user_count, num_rbs=12, seed=seed)
+        output = proposed_algorithm(num_users=user_count, num_rbs=12, seed=seed, config=config)
         counts = output["counts"]
         selected = set(output["selected_users"].tolist())
         miss_terms = []
@@ -1327,11 +1337,11 @@ def figure_6(plot=False, seed=7):
     return result
 
 
-def figure_7(plot=False, seed=7, rounds=130):
+def figure_7(plot=False, seed=7, rounds=130, config=None):
     data = load_mnist_data(num_users=15, samples_per_user=[240, 200, 160, 80, 40] * 3, test_samples=1000, seed=seed)
     curves = {}
     for name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b, "baseline_c": baseline_c}.items():
-        output = runner(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=rounds, num_rbs=12, seed=seed, batch_size=32)
+        output = runner(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=rounds, num_rbs=12, seed=seed, batch_size=32, config=config)
         curves[name] = output["metrics"]["accuracy"]
     result = {"rounds": list(range(1, rounds + 1)), "accuracy": curves}
     if plot:
@@ -1349,23 +1359,23 @@ def figure_7(plot=False, seed=7, rounds=130):
     return result
 
 
-def figure_8(plot=False, seed=7):
+def figure_8(plot=False, seed=7, config=None):
     user_counts = [3, 6, 9, 12, 15, 18]
     curves = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
     for user_count in user_counts:
         samples = ([180, 150, 120, 60, 30] * ((user_count + 4) // 5))[:user_count]
         data = load_mnist_data(num_users=user_count, samples_per_user=samples, test_samples=800, seed=seed)
         curves["proposed"].append(
-            proposed_algorithm(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed)["metrics"]["accuracy"][-1]
+            proposed_algorithm(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
         curves["baseline_a"].append(
-            baseline_a(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed)["metrics"]["accuracy"][-1]
+            baseline_a(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
         curves["baseline_b"].append(
-            baseline_b(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed)["metrics"]["accuracy"][-1]
+            baseline_b(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
         curves["baseline_c"].append(
-            baseline_c(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed)["metrics"]["accuracy"][-1]
+            baseline_c(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
     result = {"users": user_counts, "accuracy": curves}
     if plot:
@@ -1385,22 +1395,22 @@ def figure_8(plot=False, seed=7):
     return result
 
 
-def figure_9(plot=False, seed=7):
+def figure_9(plot=False, seed=7, config=None):
     rb_counts = [3, 6, 9, 12]
     data = load_mnist_data(num_users=15, samples_per_user=[180, 150, 120, 60, 30] * 3, test_samples=800, seed=seed)
     curves = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
     for rb_count in rb_counts:
         curves["proposed"].append(
-            proposed_algorithm(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed)["metrics"]["accuracy"][-1]
+            proposed_algorithm(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
         curves["baseline_a"].append(
-            baseline_a(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed)["metrics"]["accuracy"][-1]
+            baseline_a(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
         curves["baseline_b"].append(
-            baseline_b(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed)["metrics"]["accuracy"][-1]
+            baseline_b(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
         curves["baseline_c"].append(
-            baseline_c(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed)["metrics"]["accuracy"][-1]
+            baseline_c(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
     result = {"rbs": rb_counts, "accuracy": curves}
     if plot:
@@ -1420,10 +1430,10 @@ def figure_9(plot=False, seed=7):
     return result
 
 
-def figure_10(plot=False, seed=7):
+def figure_10(plot=False, seed=7, config=None):
     data = load_mnist_data(num_users=15, samples_per_user=300, test_samples=36, seed=seed)
-    proposed = proposed_algorithm(data["users"], MNISTCNN, task="mnist", test_data=data["test"], rounds=8, num_rbs=12, seed=seed, batch_size=32)
-    baseline = baseline_b(data["users"], MNISTCNN, task="mnist", test_data=data["test"], rounds=8, num_rbs=12, seed=seed, batch_size=32)
+    proposed = proposed_algorithm(data["users"], MNISTCNN, task="mnist", test_data=data["test"], rounds=8, num_rbs=12, seed=seed, batch_size=32, config=config)
+    baseline = baseline_b(data["users"], MNISTCNN, task="mnist", test_data=data["test"], rounds=8, num_rbs=12, seed=seed, batch_size=32, config=config)
     result = {
         "proposed_accuracy": proposed["metrics"]["accuracy"][-1],
         "baseline_b_accuracy": baseline["metrics"]["accuracy"][-1],
@@ -1497,7 +1507,7 @@ def main():
     if should_save:
         output_dir.mkdir(parents=True, exist_ok=True)
     for name, func in selected.items():
-        result = func(plot=args.plot or should_save, seed=args.seed)
+        result = func(plot=args.plot or should_save, seed=args.seed, config=config)
         if "figure" in result and should_save:
             fig = result["figure"]
             for ax in fig.axes:

@@ -1,0 +1,21 @@
+# Runtime override consumed by main.py.
+# Fig. 3 does not state the exact number of red-cross regression samples.
+figures:
+  figure_3:
+    data_count: 50
+
+# Candidate values for implementation parameters that are not fully specified
+# in the paper and may need sensitivity checks.
+sweep:
+  figures.figure_3.data_count:
+    values: [50, 100, 450]
+  training.regression_lr:
+    values: [0.04, 0.08, 0.12]
+  training.mnist_lr:
+    values: [0.04, 0.08, 0.12]
+  training.quantization_bits:
+    values: [1, 8, 16, 32]
+  wireless.rayleigh_mean:
+    values: [0.5, 1.0, 2.0]
+  wireless.interference_w:
+    values: [0.00000001, 0.00000003, 0.0000001]
