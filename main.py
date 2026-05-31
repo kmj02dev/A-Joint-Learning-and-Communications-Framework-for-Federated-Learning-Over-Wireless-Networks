@@ -379,7 +379,7 @@ def baseline_a(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            loss = (prediction - target).pow(2).sum() / target.pow(2).sum().clamp_min(1e-12)
+                            loss = (prediction - target).pow(2).mean()
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -398,7 +398,6 @@ def baseline_a(
 
             global_model.eval()
             eval_loss = 0.0
-            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -419,14 +418,13 @@ def baseline_a(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
-                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_scale, 1e-12) if task == "regression" else eval_loss / max(eval_total, 1))
+            metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -611,7 +609,7 @@ def baseline_b(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            loss = (prediction - target).pow(2).sum() / target.pow(2).sum().clamp_min(1e-12)
+                            loss = (prediction - target).pow(2).mean()
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -630,7 +628,6 @@ def baseline_b(
 
             global_model.eval()
             eval_loss = 0.0
-            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -651,14 +648,13 @@ def baseline_b(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
-                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_scale, 1e-12) if task == "regression" else eval_loss / max(eval_total, 1))
+            metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -845,7 +841,7 @@ def baseline_c(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            loss = (prediction - target).pow(2).sum() / target.pow(2).sum().clamp_min(1e-12)
+                            loss = (prediction - target).pow(2).mean()
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -864,7 +860,6 @@ def baseline_c(
 
             global_model.eval()
             eval_loss = 0.0
-            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -885,14 +880,13 @@ def baseline_c(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
-                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_scale, 1e-12) if task == "regression" else eval_loss / max(eval_total, 1))
+            metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -1124,7 +1118,7 @@ def proposed_algorithm(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            loss = (prediction - target).pow(2).sum() / target.pow(2).sum().clamp_min(1e-12)
+                            loss = (prediction - target).pow(2).mean()
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -1143,7 +1137,6 @@ def proposed_algorithm(
 
             global_model.eval()
             eval_loss = 0.0
-            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -1164,14 +1157,13 @@ def proposed_algorithm(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
-                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_scale, 1e-12) if task == "regression" else eval_loss / max(eval_total, 1))
+            metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -1310,6 +1302,7 @@ def figure_3(plot=False, seed=SEED, config=None):
             "batch_size": batch_size,
             "activation": activation,
             "learning_rate": learning_rate,
+            "loss_function": "mse",
             "optimal_resource_search": "heuristic",
         }
     }
@@ -1446,6 +1439,7 @@ def figure_4(plot=False, seed=SEED, config=None):
             "batch_size": batch_size,
             "activation": activation,
             "learning_rate": learning_rate,
+            "loss_function": "mse",
             "loss_source": "training",
         },
     }
