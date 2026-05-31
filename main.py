@@ -1410,7 +1410,7 @@ def load_yaml(path=None):
             "device": "auto",
             "quantization_bits": 16,
             "eval_batch_size": 256,
-            "regression_loss": "mse",
+            "regression_loss": "nmse",
             "regression_scale_floor": 1e-12,
             "regression_lr": 0.08,
             "mnist_lr": 0.08,
@@ -1596,6 +1596,7 @@ def figure_4(plot=False, seed=SEED, config=None):
     activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
     noise_std = 0.4
     learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["regression_lr"])))
+    eval_batch_size = int(first_candidate(cfg.get("training", {}).get("eval_batch_size", 256)))
     regression_loss = str(first_candidate(figure_cfg.get("regression_loss", first_candidate(cfg["training"].get("regression_loss", "mse"))))).lower()
     if regression_loss not in {"mse", "nmse"}:
         raise ValueError("regression_loss must be 'mse' or 'nmse'")
@@ -1613,21 +1614,31 @@ def figure_4(plot=False, seed=SEED, config=None):
         for curve_name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}.items():
             model_instance = RegressionFNN(activation=activation)
             model_instance.load_state_dict(copy.deepcopy(initial_state))
-            curves[curve_name].append(
-                runner(
-                    data["users"],
-                    model_instance,
-                    task="regression",
-                    test_data=train_data,
-                    rounds=rounds,
-                    num_rbs=num_rbs,
-                    local_epochs=local_epochs,
-                    batch_size=batch_size,
-                    learning_rate=learning_rate,
-                    seed=seed,
-                    config=run_config,
-                )["metrics"]["loss"][-1]
+            output = runner(
+                data["users"],
+                model_instance,
+                task="regression",
+                test_data=train_data,
+                rounds=rounds,
+                num_rbs=num_rbs,
+                local_epochs=local_epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                seed=seed,
+                config=run_config,
             )
+            fitted = RegressionFNN(activation=activation)
+            fitted.load_state_dict(output["model_state"])
+            fitted.eval()
+            display_loss = 0.0
+            display_total = 0
+            with torch.no_grad():
+                for features, labels in DataLoader(train_data, batch_size=eval_batch_size, shuffle=False):
+                    prediction = fitted(features)
+                    target = labels.float().reshape_as(prediction)
+                    display_loss += float((prediction - target).pow(2).sum().item())
+                    display_total += len(features)
+            curves[curve_name].append(display_loss / max(display_total, 1))
     result = {
         "samples_per_user": sample_counts,
         "loss": curves,
@@ -1640,8 +1651,9 @@ def figure_4(plot=False, seed=SEED, config=None):
             "activation": activation,
             "noise_std": noise_std,
             "learning_rate": learning_rate,
-            "loss_function": regression_loss,
-            "loss_source": "training",
+            "training_loss_function": regression_loss,
+            "loss_function": "mse",
+            "loss_source": "training_mse_after_training",
             "data_sampling": "independent_per_count",
             "data_seeds": data_seeds,
         },
