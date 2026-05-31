@@ -5,6 +5,11 @@ seed: [0, 42, 1004]
 # Values below are not stated explicitly in the paper. Keep them singleton
 # lists by default so they are sweepable without expanding this baseline grid.
 wireless:
+  radius_m: [500.0]
+  path_loss_alpha: [2.0]
+  rayleigh_mean: [1.0]
+  interference_w: [3.0e-8]
+  downlink_interference_w: [1.0e-10]
   min_distance_m: [5.0]
   interference_lognormal_sigma: [0.35]
   rate_floor: [1.0e-12]
