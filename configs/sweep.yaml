@@ -1,21 +1,24 @@
-# Runtime override consumed by main.py.
-# Fig. 3 does not state the exact number of red-cross regression samples.
+# Runtime override consumed by main.py. Values under figures may be scalars
+# or lists. Lists define the experiment candidates to run from this YAML.
 figures:
   figure_3:
-    data_count: 50
-
-# Candidate values for implementation parameters that are not fully specified
-# in the paper and may need sensitivity checks.
-sweep:
-  figures.figure_3.data_count:
-    values: [50, 100, 450]
-  training.regression_lr:
-    values: [0.04, 0.08, 0.12]
-  training.mnist_lr:
-    values: [0.04, 0.08, 0.12]
-  training.quantization_bits:
-    values: [1, 8, 16, 32]
-  wireless.rayleigh_mean:
-    values: [0.5, 1.0, 2.0]
-  wireless.interference_w:
-    values: [0.00000001, 0.00000003, 0.0000001]
+    # Fig. 3 does not state the exact number of red-cross regression samples.
+    data_count: [50]
+    test_count: [1000]
+    rounds: [10, 30, 50, 130]
+    num_rbs: [3, 6, 9, 12, 15]
+    local_epochs: [1]
+    batch_size: [32]
+    activation: [identity, relu]
+    learning_rate: [0.01, 0.1]
+  figure_4:
+    # sample_counts is itself a list-valued parameter, so use list-of-lists.
+    sample_counts:
+      - [10, 20, 30, 40, 50]
+    test_count: [1000]
+    rounds: [10, 30, 50, 130]
+    num_rbs: [3, 6, 9, 12, 15]
+    local_epochs: [1]
+    batch_size: [32]
+    activation: [identity, relu]
+    learning_rate: [0.01, 0.1]

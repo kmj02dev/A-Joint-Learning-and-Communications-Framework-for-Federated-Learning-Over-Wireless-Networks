@@ -17,8 +17,12 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset, TensorDataset
 
 
+CACHED_DATA = {}
+SEED = 42
+
+
 # data processing
-def generate_synthetic_data(num_users=15, samples_per_user=30, seed=7, noise_std=0.4):
+def generate_synthetic_data(num_users=15, samples_per_user=30, seed=SEED, noise_std=0.4):
     """Generate the linear-regression data used in the paper: y=-2x+1+0.4N(0,1)."""
     rng = np.random.default_rng(seed)
     if isinstance(samples_per_user, int):
@@ -46,7 +50,7 @@ def generate_synthetic_data(num_users=15, samples_per_user=30, seed=7, noise_std
     }
 
 
-def load_mnist_data(num_users=15, samples_per_user=200, test_samples=1000, seed=7, data_dir=None, download=False):
+def load_mnist_data(num_users=15, samples_per_user=200, test_samples=1000, seed=SEED, data_dir=None, download=False):
     """Load MNIST from a local npz/cache first, with torchvision download as an opt-in fallback."""
     rng = np.random.default_rng(seed)
     candidates = []
@@ -128,7 +132,7 @@ def load_mnist_data(num_users=15, samples_per_user=200, test_samples=1000, seed=
     return {"train": train_data, "test": test_data, "users": users, "task": "mnist"}
 
 
-def get_partitioned_data(data=None, num_users=15, samples_per_user=None, seed=7, non_iid=False):
+def get_partitioned_data(data=None, num_users=15, samples_per_user=None, seed=SEED, non_iid=False):
     """Partition a TensorDataset into user-local datasets for FL."""
     if data is None:
         return generate_synthetic_data(num_users=num_users, samples_per_user=samples_per_user or 30, seed=seed)["users"]
@@ -168,9 +172,19 @@ def get_partitioned_data(data=None, num_users=15, samples_per_user=None, seed=7,
 
 # models
 class RegressionFNN(nn.Module):
-    def __init__(self, hidden_size=20):
+    def __init__(self, hidden_size=20, activation="tanh"):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(1, hidden_size), nn.Tanh(), nn.Linear(hidden_size, 1))
+        if activation == "tanh":
+            nonlinear = nn.Tanh()
+        elif activation == "relu":
+            nonlinear = nn.ReLU()
+        elif activation == "sigmoid":
+            nonlinear = nn.Sigmoid()
+        elif activation == "identity":
+            nonlinear = nn.Identity()
+        else:
+            raise ValueError(f"Unsupported regression activation: {activation}")
+        self.net = nn.Sequential(nn.Linear(1, hidden_size), nonlinear, nn.Linear(hidden_size, 1))
 
     def forward(self, x):
         return self.net(x.reshape(x.shape[0], -1))
@@ -345,7 +359,7 @@ def baseline_a(
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
         device_obj = torch.device(device_name)
         global_model = model.to(device_obj)
-        loss_fn = nn.MSELoss() if task == "regression" else nn.CrossEntropyLoss()
+        loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
 
         for _ in range(int(rounds)):
@@ -364,7 +378,8 @@ def baseline_a(
                         optimizer.zero_grad()
                         prediction = local_model(features)
                         if task == "regression":
-                            loss = loss_fn(prediction, labels.float().reshape_as(prediction))
+                            target = labels.float().reshape_as(prediction)
+                            loss = (prediction - target).pow(2).sum() / target.pow(2).sum().clamp_min(1e-12)
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -383,6 +398,7 @@ def baseline_a(
 
             global_model.eval()
             eval_loss = 0.0
+            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -401,15 +417,16 @@ def baseline_a(
                     labels = labels.to(device_obj)
                     prediction = global_model(features)
                     if task == "regression":
-                        loss = loss_fn(prediction, labels.float().reshape_as(prediction))
-                        eval_loss += float(loss.item()) * len(features)
+                        target = labels.float().reshape_as(prediction)
+                        eval_loss += float((prediction - target).pow(2).sum().item())
+                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_total, 1))
+            metrics["loss"].append(eval_loss / max(eval_scale, 1e-12) if task == "regression" else eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -574,7 +591,7 @@ def baseline_b(
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
         device_obj = torch.device(device_name)
         global_model = model.to(device_obj)
-        loss_fn = nn.MSELoss() if task == "regression" else nn.CrossEntropyLoss()
+        loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
 
         for _ in range(int(rounds)):
@@ -593,7 +610,8 @@ def baseline_b(
                         optimizer.zero_grad()
                         prediction = local_model(features)
                         if task == "regression":
-                            loss = loss_fn(prediction, labels.float().reshape_as(prediction))
+                            target = labels.float().reshape_as(prediction)
+                            loss = (prediction - target).pow(2).sum() / target.pow(2).sum().clamp_min(1e-12)
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -612,6 +630,7 @@ def baseline_b(
 
             global_model.eval()
             eval_loss = 0.0
+            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -630,15 +649,16 @@ def baseline_b(
                     labels = labels.to(device_obj)
                     prediction = global_model(features)
                     if task == "regression":
-                        loss = loss_fn(prediction, labels.float().reshape_as(prediction))
-                        eval_loss += float(loss.item()) * len(features)
+                        target = labels.float().reshape_as(prediction)
+                        eval_loss += float((prediction - target).pow(2).sum().item())
+                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_total, 1))
+            metrics["loss"].append(eval_loss / max(eval_scale, 1e-12) if task == "regression" else eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -805,7 +825,7 @@ def baseline_c(
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
         device_obj = torch.device(device_name)
         global_model = model.to(device_obj)
-        loss_fn = nn.MSELoss() if task == "regression" else nn.CrossEntropyLoss()
+        loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
 
         for _ in range(int(rounds)):
@@ -824,7 +844,8 @@ def baseline_c(
                         optimizer.zero_grad()
                         prediction = local_model(features)
                         if task == "regression":
-                            loss = loss_fn(prediction, labels.float().reshape_as(prediction))
+                            target = labels.float().reshape_as(prediction)
+                            loss = (prediction - target).pow(2).sum() / target.pow(2).sum().clamp_min(1e-12)
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -843,6 +864,7 @@ def baseline_c(
 
             global_model.eval()
             eval_loss = 0.0
+            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -861,15 +883,16 @@ def baseline_c(
                     labels = labels.to(device_obj)
                     prediction = global_model(features)
                     if task == "regression":
-                        loss = loss_fn(prediction, labels.float().reshape_as(prediction))
-                        eval_loss += float(loss.item()) * len(features)
+                        target = labels.float().reshape_as(prediction)
+                        eval_loss += float((prediction - target).pow(2).sum().item())
+                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_total, 1))
+            metrics["loss"].append(eval_loss / max(eval_scale, 1e-12) if task == "regression" else eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -1036,7 +1059,7 @@ def proposed_algorithm(
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
         device_obj = torch.device(device_name)
         global_model = model.to(device_obj)
-        loss_fn = nn.MSELoss() if task == "regression" else nn.CrossEntropyLoss()
+        loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
 
         for _ in range(int(rounds)):
@@ -1055,7 +1078,8 @@ def proposed_algorithm(
                         optimizer.zero_grad()
                         prediction = local_model(features)
                         if task == "regression":
-                            loss = loss_fn(prediction, labels.float().reshape_as(prediction))
+                            target = labels.float().reshape_as(prediction)
+                            loss = (prediction - target).pow(2).sum() / target.pow(2).sum().clamp_min(1e-12)
                         else:
                             loss = loss_fn(prediction, labels.long())
                         loss.backward()
@@ -1074,6 +1098,7 @@ def proposed_algorithm(
 
             global_model.eval()
             eval_loss = 0.0
+            eval_scale = 0.0
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -1092,15 +1117,16 @@ def proposed_algorithm(
                     labels = labels.to(device_obj)
                     prediction = global_model(features)
                     if task == "regression":
-                        loss = loss_fn(prediction, labels.float().reshape_as(prediction))
-                        eval_loss += float(loss.item()) * len(features)
+                        target = labels.float().reshape_as(prediction)
+                        eval_loss += float((prediction - target).pow(2).sum().item())
+                        eval_scale += float(target.pow(2).sum().item())
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
                         eval_loss += float(loss.item()) * len(features)
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
-            metrics["loss"].append(eval_loss / max(eval_total, 1))
+            metrics["loss"].append(eval_loss / max(eval_scale, 1e-12) if task == "regression" else eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
@@ -1136,7 +1162,7 @@ def proposed_algorithm(
 def load_yaml(path=None):
     """Load an optional YAML override on top of Table II/default experiment settings."""
     config = {
-        "seed": 7,
+        "seed": SEED,
         "wireless": {
             "radius_m": 500.0,
             "path_loss_alpha": 2.0,
@@ -1165,6 +1191,23 @@ def load_yaml(path=None):
         "figures": {
             "figure_3": {
                 "data_count": 50,
+                "test_count": 1000,
+                "rounds": 80,
+                "num_rbs": 12,
+                "local_epochs": 1,
+                "batch_size": 32,
+                "activation": "tanh",
+                "learning_rate": 0.01,
+            },
+            "figure_4": {
+                "sample_counts": [10, 20, 30, 40, 50],
+                "test_count": 1000,
+                "rounds": 60,
+                "num_rbs": 12,
+                "local_epochs": 1,
+                "batch_size": 32,
+                "activation": "tanh",
+                "learning_rate": 0.01,
             },
         },
     }
@@ -1185,34 +1228,67 @@ def load_yaml(path=None):
 
 
 # figures
-def figure_3(plot=False, seed=7, config=None):
+def figure_3(plot=False, seed=SEED, config=None):
     cfg = load_yaml() if config is None else config
-    data_count = int(cfg.get("figures", {}).get("figure_3", {}).get("data_count", 50))
+    figure_cfg = cfg.get("figures", {}).get("figure_3", {})
+
+    def first_candidate(value):
+        if isinstance(value, list):
+            if not value:
+                raise ValueError("Figure configuration candidate lists must not be empty")
+            return value[0]
+        return value
+
+    data_count = int(first_candidate(figure_cfg.get("data_count", 50)))
+    test_count = int(first_candidate(figure_cfg.get("test_count", 1000)))
+    rounds = int(first_candidate(figure_cfg.get("rounds", 80)))
+    num_rbs = int(first_candidate(figure_cfg.get("num_rbs", 12)))
+    local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
+    batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
+    activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
+    learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["regression_lr"])))
     base_count = data_count // 15
     remainder = data_count % 15
     samples_per_user = [base_count + (1 if user_idx < remainder else 0) for user_idx in range(15)]
     data = generate_synthetic_data(num_users=15, samples_per_user=samples_per_user, seed=seed)
-    test_data = TensorDataset(data["x"], data["y"])
-    result = {}
+    rng = np.random.default_rng(seed)
+    test_x = np.linspace(0.0, 1.0, test_count, dtype=np.float32).reshape(-1, 1)
+    test_y = -2.0 * test_x + 1.0 + 0.4 * rng.standard_normal((test_count, 1)).astype(np.float32)
+    test_data = TensorDataset(torch.from_numpy(test_x), torch.from_numpy(test_y.astype(np.float32)))
+    result = {
+        "hyperparameters": {
+            "data_count": data_count,
+            "test_count": test_count,
+            "rounds": rounds,
+            "num_rbs": num_rbs,
+            "local_epochs": local_epochs,
+            "batch_size": batch_size,
+            "activation": activation,
+            "learning_rate": learning_rate,
+        }
+    }
     for name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}.items():
-        output = runner(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=80, num_rbs=12, seed=seed, config=config)
+        output = runner(
+            data["users"],
+            RegressionFNN(activation=activation),
+            task="regression",
+            test_data=test_data,
+            rounds=rounds,
+            num_rbs=num_rbs,
+            local_epochs=local_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            seed=seed,
+            config=config,
+        )
         result[name] = {"loss": output["metrics"]["loss"][-1], "selected": len(output["selected_users"]), "model_state": output["model_state"]}
 
-    ideal = RegressionFNN()
-    optimizer = torch.optim.SGD(ideal.parameters(), lr=0.08)
-    loader = DataLoader(test_data, batch_size=64, shuffle=True)
-    for _ in range(80):
-        for features, labels in loader:
-            optimizer.zero_grad()
-            loss = nn.MSELoss()(ideal(features), labels)
-            loss.backward()
-            optimizer.step()
     xs = torch.linspace(0, 1, 100).reshape(-1, 1)
     with torch.no_grad():
         result["x_grid"] = xs.numpy().ravel()
-        result["ideal_prediction"] = ideal(xs).numpy().ravel()
+        result["ideal_prediction"] = (-2.0 * xs + 1.0).numpy().ravel()
         result["samples"] = (data["x"].numpy().ravel(), data["y"].numpy().ravel())
-        result["ideal_loss"] = float(nn.MSELoss()(ideal(data["x"]), data["y"]).item())
+        result["ideal_loss"] = 0.0
     if plot:
         fig, ax = plt.subplots()
         ax.scatter(result["samples"][0], result["samples"][1], marker="x", color="red", label="Data samples")
@@ -1221,7 +1297,7 @@ def figure_3(plot=False, seed=7, config=None):
             ("baseline_a", "Baseline a)", "black", "-", 2.0),
             ("baseline_b", "Baseline b)", "limegreen", "-", 2.0),
         ]:
-            fitted = RegressionFNN()
+            fitted = RegressionFNN(activation=activation)
             fitted.load_state_dict(result[key]["model_state"])
             with torch.no_grad():
                 prediction = fitted(xs).numpy().ravel()
@@ -1241,22 +1317,103 @@ def figure_3(plot=False, seed=7, config=None):
     return result
 
 
-def figure_4(plot=False, seed=7, config=None):
-    sample_counts = [10, 20, 30, 40, 50]
+def figure_4(plot=False, seed=SEED, config=None):
+    cfg = load_yaml() if config is None else config
+    figure_cfg = cfg.get("figures", {}).get("figure_4", {})
+
+    def first_candidate(value):
+        if isinstance(value, list):
+            if not value:
+                raise ValueError("Figure configuration candidate lists must not be empty")
+            return value[0]
+        return value
+
+    sample_counts_raw = figure_cfg.get("sample_counts", [10, 20, 30, 40, 50])
+    if isinstance(sample_counts_raw, list) and sample_counts_raw and isinstance(sample_counts_raw[0], list):
+        sample_counts_raw = sample_counts_raw[0]
+    sample_counts = [int(value) for value in sample_counts_raw]
+    if not sample_counts:
+        raise ValueError("figure_4.sample_counts must not be empty")
+    test_count = int(first_candidate(figure_cfg.get("test_count", 1000)))
+    rounds = int(first_candidate(figure_cfg.get("rounds", 60)))
+    num_rbs = int(first_candidate(figure_cfg.get("num_rbs", 12)))
+    local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
+    batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
+    activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
+    learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["regression_lr"])))
+    rng = np.random.default_rng(seed)
+    test_x = np.linspace(0.0, 1.0, test_count, dtype=np.float32).reshape(-1, 1)
+    test_y = -2.0 * test_x + 1.0 + 0.4 * rng.standard_normal((test_count, 1)).astype(np.float32)
+    test_data = TensorDataset(torch.from_numpy(test_x), torch.from_numpy(test_y.astype(np.float32)))
+    full_data = generate_synthetic_data(num_users=15, samples_per_user=max(sample_counts), seed=seed)
     curves = {"proposed": [], "baseline_a": [], "baseline_b": []}
     for count in sample_counts:
-        data = generate_synthetic_data(num_users=15, samples_per_user=count, seed=seed)
-        test_data = TensorDataset(data["x"], data["y"])
+        data = {
+            "users": [TensorDataset(user_data.tensors[0][:count], user_data.tensors[1][:count]) for user_data in full_data["users"]],
+            "x": torch.cat([user_data.tensors[0][:count] for user_data in full_data["users"]]),
+            "y": torch.cat([user_data.tensors[1][:count] for user_data in full_data["users"]]),
+            "counts": [count] * 15,
+            "task": "regression",
+        }
         curves["proposed"].append(
-            proposed_algorithm(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=60, num_rbs=12, seed=seed, config=config)["metrics"]["loss"][-1]
+            proposed_algorithm(
+                data["users"],
+                RegressionFNN(activation=activation),
+                task="regression",
+                test_data=test_data,
+                rounds=rounds,
+                num_rbs=num_rbs,
+                local_epochs=local_epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                seed=seed,
+                config=config,
+            )["metrics"]["loss"][-1]
         )
         curves["baseline_a"].append(
-            baseline_a(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=60, num_rbs=12, seed=seed, config=config)["metrics"]["loss"][-1]
+            baseline_a(
+                data["users"],
+                RegressionFNN(activation=activation),
+                task="regression",
+                test_data=test_data,
+                rounds=rounds,
+                num_rbs=num_rbs,
+                local_epochs=local_epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                seed=seed,
+                config=config,
+            )["metrics"]["loss"][-1]
         )
         curves["baseline_b"].append(
-            baseline_b(data["users"], RegressionFNN, task="regression", test_data=test_data, rounds=60, num_rbs=12, seed=seed, config=config)["metrics"]["loss"][-1]
+            baseline_b(
+                data["users"],
+                RegressionFNN(activation=activation),
+                task="regression",
+                test_data=test_data,
+                rounds=rounds,
+                num_rbs=num_rbs,
+                local_epochs=local_epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                seed=seed,
+                config=config,
+            )["metrics"]["loss"][-1]
         )
-    result = {"samples_per_user": sample_counts, "loss": curves}
+    result = {
+        "samples_per_user": sample_counts,
+        "loss": curves,
+        "hyperparameters": {
+            "sample_counts": sample_counts,
+            "test_count": test_count,
+            "rounds": rounds,
+            "num_rbs": num_rbs,
+            "local_epochs": local_epochs,
+            "batch_size": batch_size,
+            "activation": activation,
+            "learning_rate": learning_rate,
+        },
+    }
     if plot:
         fig, ax = plt.subplots()
         ax.plot(sample_counts, curves["proposed"], color="blue", marker="o", linewidth=2.5, label="Proposed algorithm")
@@ -1275,7 +1432,7 @@ def figure_4(plot=False, seed=7, config=None):
     return result
 
 
-def figure_5(plot=False, seed=7, config=None):
+def figure_5(plot=False, seed=SEED, config=None):
     users = [3, 6, 10, 15, 20, 25]
     curves = {10: [], 15: []}
     timings = {10: [], 15: []}
@@ -1298,7 +1455,7 @@ def figure_5(plot=False, seed=7, config=None):
     return result
 
 
-def figure_6(plot=False, seed=7, config=None):
+def figure_6(plot=False, seed=SEED, config=None):
     users = [3, 6, 9, 12, 15, 18]
     theoretical = []
     simulated = []
@@ -1337,7 +1494,7 @@ def figure_6(plot=False, seed=7, config=None):
     return result
 
 
-def figure_7(plot=False, seed=7, rounds=130, config=None):
+def figure_7(plot=False, seed=SEED, rounds=130, config=None):
     data = load_mnist_data(num_users=15, samples_per_user=[240, 200, 160, 80, 40] * 3, test_samples=1000, seed=seed)
     curves = {}
     for name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b, "baseline_c": baseline_c}.items():
@@ -1359,23 +1516,25 @@ def figure_7(plot=False, seed=7, rounds=130, config=None):
     return result
 
 
-def figure_8(plot=False, seed=7, config=None):
+def figure_8(plot=False, seed=SEED, config=None):
     user_counts = [3, 6, 9, 12, 15, 18]
+    shared = load_mnist_data(num_users=max(user_counts), samples_per_user=180, test_samples=800, seed=seed)
+    test_data = shared["test"]
     curves = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
     for user_count in user_counts:
         samples = ([180, 150, 120, 60, 30] * ((user_count + 4) // 5))[:user_count]
         data = load_mnist_data(num_users=user_count, samples_per_user=samples, test_samples=800, seed=seed)
         curves["proposed"].append(
-            proposed_algorithm(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
+            proposed_algorithm(data["users"], MNISTFNN, task="mnist", test_data=test_data, rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
         curves["baseline_a"].append(
-            baseline_a(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
+            baseline_a(data["users"], MNISTFNN, task="mnist", test_data=test_data, rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
         curves["baseline_b"].append(
-            baseline_b(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
+            baseline_b(data["users"], MNISTFNN, task="mnist", test_data=test_data, rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
         curves["baseline_c"].append(
-            baseline_c(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
+            baseline_c(data["users"], MNISTFNN, task="mnist", test_data=test_data, rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
         )
     result = {"users": user_counts, "accuracy": curves}
     if plot:
@@ -1395,7 +1554,7 @@ def figure_8(plot=False, seed=7, config=None):
     return result
 
 
-def figure_9(plot=False, seed=7, config=None):
+def figure_9(plot=False, seed=SEED, config=None):
     rb_counts = [3, 6, 9, 12]
     data = load_mnist_data(num_users=15, samples_per_user=[180, 150, 120, 60, 30] * 3, test_samples=800, seed=seed)
     curves = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
@@ -1430,7 +1589,7 @@ def figure_9(plot=False, seed=7, config=None):
     return result
 
 
-def figure_10(plot=False, seed=7, config=None):
+def figure_10(plot=False, seed=SEED, config=None):
     data = load_mnist_data(num_users=15, samples_per_user=300, test_samples=36, seed=seed)
     proposed = proposed_algorithm(data["users"], MNISTCNN, task="mnist", test_data=data["test"], rounds=8, num_rbs=12, seed=seed, batch_size=32, config=config)
     baseline = baseline_b(data["users"], MNISTCNN, task="mnist", test_data=data["test"], rounds=8, num_rbs=12, seed=seed, batch_size=32, config=config)
@@ -1475,7 +1634,7 @@ def main():
     parser.add_argument("--config", default=None)
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--output-dir", default="outputs")
-    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--seed", type=int, default=SEED)
     args = parser.parse_args()
 
     config = load_yaml(args.config) if args.config else load_yaml()
@@ -1503,51 +1662,122 @@ def main():
     }
     selected = calls if args.figure == "all" else {args.figure: calls[args.figure]}
     output_dir = Path(args.output_dir)
-    should_save = args.figure == "all"
-    if should_save:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def candidate_values(key, value):
+        if not isinstance(value, list):
+            return [value]
+        if key == "sample_counts" and (not value or not isinstance(value[0], list)):
+            return [value]
+        if not value:
+            raise ValueError(f"figures.figure_*.{key} must not be an empty list")
+        return value
+
+    def figure_runs(name):
+        figure_key = f"figure_{name}"
+        figure_config = config.get("figures", {}).get(figure_key, {})
+        run_values = [({}, {})]
+        for key, value in figure_config.items():
+            values = candidate_values(key, value)
+            next_run_values = []
+            for existing, varied in run_values:
+                for candidate in values:
+                    updated = dict(existing)
+                    updated[key] = candidate
+                    updated_varied = dict(varied)
+                    if len(values) > 1:
+                        updated_varied[key] = candidate
+                    next_run_values.append((updated, updated_varied))
+            run_values = next_run_values
+
+        runs = []
+        for values, varied in run_values:
+            run_config = copy.deepcopy(config)
+            run_config.setdefault("figures", {}).setdefault(figure_key, {})
+            run_config["figures"][figure_key].update(values)
+            run_config["seed"] = args.seed
+            runs.append((run_config, varied))
+        return runs or [(copy.deepcopy(config), {})]
+
+    def value_token(value):
+        if isinstance(value, list):
+            raw = "_".join(str(item) for item in value)
+        else:
+            raw = str(value)
+        raw = raw.replace("-", "m").replace(".", "p")
+        token = "".join(char if char.isalnum() else "_" for char in raw).strip("_")
+        return token or "value"
+
+    def run_token(varied):
+        if not varied:
+            return "default"
+        return "_".join(f"{key}_{value_token(value)}" for key, value in varied.items())
+
+    def format_figure(fig, name):
+        for ax in fig.axes:
+            if name != "10":
+                ax.grid(True, color="#d9d9d9", linewidth=0.8, alpha=0.8)
+                ax.tick_params(direction="in", top=True, right=True)
+                for spine in ax.spines.values():
+                    spine.set_visible(True)
+                    spine.set_color("black")
+                    spine.set_linewidth(1.0)
+            legend = ax.get_legend()
+            if legend is not None:
+                legend.get_frame().set_edgecolor("black")
+                legend.get_frame().set_linewidth(0.8)
+                legend.get_frame().set_alpha(1.0)
+        if name == "10":
+            fig.subplots_adjust(left=0.05, right=0.98, bottom=0.05, top=0.89, hspace=0.55, wspace=0.35)
+        else:
+            fig.tight_layout()
+
+    planned = {name: figure_runs(name) for name in selected}
+    total_runs = sum(len(runs) for runs in planned.values())
+    print(f"planned_runs: {total_runs}")
+    if total_runs >= 100:
+        print(f"warning: YAML expands to {total_runs} runs; narrow candidate lists if this is unintended.")
+
     for name, func in selected.items():
-        result = func(plot=args.plot or should_save, seed=args.seed, config=config)
-        if "figure" in result and should_save:
-            fig = result["figure"]
-            for ax in fig.axes:
-                if name != "10":
-                    ax.grid(True, color="#d9d9d9", linewidth=0.8, alpha=0.8)
-                    ax.tick_params(direction="in", top=True, right=True)
-                    for spine in ax.spines.values():
-                        spine.set_visible(True)
-                        spine.set_color("black")
-                        spine.set_linewidth(1.0)
-                legend = ax.get_legend()
-                if legend is not None:
-                    legend.get_frame().set_edgecolor("black")
-                    legend.get_frame().set_linewidth(0.8)
-                    legend.get_frame().set_alpha(1.0)
-            if name == "10":
-                fig.subplots_adjust(left=0.05, right=0.98, bottom=0.05, top=0.89, hspace=0.55, wspace=0.35)
-            else:
-                fig.tight_layout()
-            save_path = output_dir / f"figure_{name}.png"
-            fig.savefig(save_path, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-        printable = {}
-        for key, value in result.items():
-            if key == "figure":
-                continue
-            if isinstance(value, np.ndarray):
-                printable[key] = {"shape": value.shape, "first": float(value.ravel()[0]) if value.size else None}
-            elif isinstance(value, tuple) and value and all(isinstance(item, np.ndarray) for item in value):
-                printable[key] = [{"shape": item.shape, "first": float(item.ravel()[0]) if item.size else None} for item in value]
-            elif isinstance(value, dict):
-                printable[key] = {
-                    subkey: (subvalue[-1] if isinstance(subvalue, list) and subvalue else subvalue)
-                    for subkey, subvalue in value.items()
-                }
-            else:
-                printable[key] = value
-        print(f"figure_{name}: {printable}")
-        if should_save:
-            print(f"saved: {output_dir / f'figure_{name}.png'}")
+        runs = planned[name]
+        multiple_runs = len(runs) > 1
+        for run_index, (run_config, varied) in enumerate(runs, start=1):
+            result = func(plot=True, seed=args.seed, config=run_config)
+            save_path = None
+            if "figure" in result:
+                fig = result["figure"]
+                format_figure(fig, name)
+                if multiple_runs:
+                    save_dir = output_dir / f"figure_{name}"
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    save_path = save_dir / f"{run_index:03d}_{run_token(varied)}.png"
+                else:
+                    save_path = output_dir / f"figure_{name}.png"
+                fig.savefig(save_path, dpi=200, bbox_inches="tight")
+                plt.close(fig)
+
+            printable = {}
+            for key, value in result.items():
+                if key == "figure":
+                    continue
+                if isinstance(value, np.ndarray):
+                    printable[key] = {"shape": value.shape, "first": float(value.ravel()[0]) if value.size else None}
+                elif isinstance(value, tuple) and value and all(isinstance(item, np.ndarray) for item in value):
+                    printable[key] = [{"shape": item.shape, "first": float(item.ravel()[0]) if item.size else None} for item in value]
+                elif isinstance(value, dict):
+                    printable[key] = {}
+                    for subkey, subvalue in value.items():
+                        if key == "loss" and isinstance(subvalue, list) and subvalue:
+                            printable[key][subkey] = subvalue[-1]
+                        else:
+                            printable[key][subkey] = subvalue
+                else:
+                    printable[key] = value
+            if varied:
+                printable["sweep"] = varied
+            print(f"figure_{name} run {run_index}/{len(runs)}: {printable}")
+            if save_path is not None:
+                print(f"saved: {save_path}")
 
 
 if __name__ == "__main__":

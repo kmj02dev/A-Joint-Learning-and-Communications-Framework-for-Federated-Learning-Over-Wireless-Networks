@@ -1,5 +1,6 @@
 
 CACHED_DATA = {}
+SEED = 42
 
 # data processing
 def generate_synthetic_data():
