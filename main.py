@@ -408,9 +408,11 @@ def baseline_a(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            squared_error = (prediction - target).pow(2)
+                            error = prediction - target
+                            squared_error = error.pow(2)
                             if regression_loss == "nmse":
-                                loss = squared_error.sum() / target.pow(2).sum().clamp_min(regression_scale_floor)
+                                target_range = (target.max() - target.min()).clamp_min(regression_scale_floor)
+                                loss = (2.0 * error / target_range).pow(2).mean()
                             else:
                                 loss = squared_error.mean()
                         else:
@@ -431,7 +433,8 @@ def baseline_a(
 
             global_model.eval()
             eval_loss = 0.0
-            eval_scale = 0.0
+            eval_target_min = float("inf")
+            eval_target_max = float("-inf")
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -452,7 +455,8 @@ def baseline_a(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
-                        eval_scale += float(target.pow(2).sum().item())
+                        eval_target_min = min(eval_target_min, float(target.min().item()))
+                        eval_target_max = max(eval_target_max, float(target.max().item()))
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
@@ -460,7 +464,8 @@ def baseline_a(
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
             if task == "regression" and regression_loss == "nmse":
-                metrics["loss"].append(eval_loss / max(eval_scale, regression_scale_floor))
+                target_range = max(eval_target_max - eval_target_min, regression_scale_floor) if eval_total else regression_scale_floor
+                metrics["loss"].append(4.0 * eval_loss / max(eval_total, 1) / (target_range ** 2))
             else:
                 metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
@@ -676,9 +681,11 @@ def baseline_b(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            squared_error = (prediction - target).pow(2)
+                            error = prediction - target
+                            squared_error = error.pow(2)
                             if regression_loss == "nmse":
-                                loss = squared_error.sum() / target.pow(2).sum().clamp_min(regression_scale_floor)
+                                target_range = (target.max() - target.min()).clamp_min(regression_scale_floor)
+                                loss = (2.0 * error / target_range).pow(2).mean()
                             else:
                                 loss = squared_error.mean()
                         else:
@@ -699,7 +706,8 @@ def baseline_b(
 
             global_model.eval()
             eval_loss = 0.0
-            eval_scale = 0.0
+            eval_target_min = float("inf")
+            eval_target_max = float("-inf")
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -720,7 +728,8 @@ def baseline_b(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
-                        eval_scale += float(target.pow(2).sum().item())
+                        eval_target_min = min(eval_target_min, float(target.min().item()))
+                        eval_target_max = max(eval_target_max, float(target.max().item()))
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
@@ -728,7 +737,8 @@ def baseline_b(
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
             if task == "regression" and regression_loss == "nmse":
-                metrics["loss"].append(eval_loss / max(eval_scale, regression_scale_floor))
+                target_range = max(eval_target_max - eval_target_min, regression_scale_floor) if eval_total else regression_scale_floor
+                metrics["loss"].append(4.0 * eval_loss / max(eval_total, 1) / (target_range ** 2))
             else:
                 metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
@@ -946,9 +956,11 @@ def baseline_c(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            squared_error = (prediction - target).pow(2)
+                            error = prediction - target
+                            squared_error = error.pow(2)
                             if regression_loss == "nmse":
-                                loss = squared_error.sum() / target.pow(2).sum().clamp_min(regression_scale_floor)
+                                target_range = (target.max() - target.min()).clamp_min(regression_scale_floor)
+                                loss = (2.0 * error / target_range).pow(2).mean()
                             else:
                                 loss = squared_error.mean()
                         else:
@@ -969,7 +981,8 @@ def baseline_c(
 
             global_model.eval()
             eval_loss = 0.0
-            eval_scale = 0.0
+            eval_target_min = float("inf")
+            eval_target_max = float("-inf")
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -990,7 +1003,8 @@ def baseline_c(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
-                        eval_scale += float(target.pow(2).sum().item())
+                        eval_target_min = min(eval_target_min, float(target.min().item()))
+                        eval_target_max = max(eval_target_max, float(target.max().item()))
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
@@ -998,7 +1012,8 @@ def baseline_c(
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
             if task == "regression" and regression_loss == "nmse":
-                metrics["loss"].append(eval_loss / max(eval_scale, regression_scale_floor))
+                target_range = max(eval_target_max - eval_target_min, regression_scale_floor) if eval_total else regression_scale_floor
+                metrics["loss"].append(4.0 * eval_loss / max(eval_total, 1) / (target_range ** 2))
             else:
                 metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
@@ -1262,9 +1277,11 @@ def proposed_algorithm(
                         prediction = local_model(features)
                         if task == "regression":
                             target = labels.float().reshape_as(prediction)
-                            squared_error = (prediction - target).pow(2)
+                            error = prediction - target
+                            squared_error = error.pow(2)
                             if regression_loss == "nmse":
-                                loss = squared_error.sum() / target.pow(2).sum().clamp_min(regression_scale_floor)
+                                target_range = (target.max() - target.min()).clamp_min(regression_scale_floor)
+                                loss = (2.0 * error / target_range).pow(2).mean()
                             else:
                                 loss = squared_error.mean()
                         else:
@@ -1285,7 +1302,8 @@ def proposed_algorithm(
 
             global_model.eval()
             eval_loss = 0.0
-            eval_scale = 0.0
+            eval_target_min = float("inf")
+            eval_target_max = float("-inf")
             eval_correct = 0
             eval_total = 0
             eval_source = test_data
@@ -1306,7 +1324,8 @@ def proposed_algorithm(
                     if task == "regression":
                         target = labels.float().reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
-                        eval_scale += float(target.pow(2).sum().item())
+                        eval_target_min = min(eval_target_min, float(target.min().item()))
+                        eval_target_max = max(eval_target_max, float(target.max().item()))
                         eval_total += len(features)
                     else:
                         loss = loss_fn(prediction, labels.long())
@@ -1314,7 +1333,8 @@ def proposed_algorithm(
                         eval_correct += int((prediction.argmax(dim=1) == labels).sum().item())
                         eval_total += len(features)
             if task == "regression" and regression_loss == "nmse":
-                metrics["loss"].append(eval_loss / max(eval_scale, regression_scale_floor))
+                target_range = max(eval_target_max - eval_target_min, regression_scale_floor) if eval_total else regression_scale_floor
+                metrics["loss"].append(4.0 * eval_loss / max(eval_total, 1) / (target_range ** 2))
             else:
                 metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
