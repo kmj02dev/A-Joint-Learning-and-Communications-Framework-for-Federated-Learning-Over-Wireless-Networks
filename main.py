@@ -1410,7 +1410,7 @@ def load_yaml(path=None):
             "device": "auto",
             "quantization_bits": 16,
             "eval_batch_size": 256,
-            "regression_loss": "nmse",
+            "regression_loss": "mse",
             "regression_scale_floor": 1e-12,
             "regression_lr": 0.08,
             "mnist_lr": 0.08,
