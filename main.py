@@ -240,7 +240,6 @@ def baseline_a(
     seed = int(cfg["seed"] if seed is None else seed)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    model_bits_floor = int(train_cfg.get("model_bits_floor", 1024))
     eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
     regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
     min_distance = float(wireless.get("min_distance_m", 5.0))
@@ -267,7 +266,7 @@ def baseline_a(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = max(model_bits_floor, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
+        model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
 
     radius = float(wireless["radius_m"])
     distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
@@ -501,7 +500,6 @@ def baseline_b(
     seed = int(cfg["seed"] if seed is None else seed)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    model_bits_floor = int(train_cfg.get("model_bits_floor", 1024))
     eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
     regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
     min_distance = float(wireless.get("min_distance_m", 5.0))
@@ -528,7 +526,7 @@ def baseline_b(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = max(model_bits_floor, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
+        model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
 
     radius = float(wireless["radius_m"])
     distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
@@ -753,7 +751,6 @@ def baseline_c(
     seed = int(cfg["seed"] if seed is None else seed)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    model_bits_floor = int(train_cfg.get("model_bits_floor", 1024))
     eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
     regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
     min_distance = float(wireless.get("min_distance_m", 5.0))
@@ -780,7 +777,7 @@ def baseline_c(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = max(model_bits_floor, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
+        model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
 
     radius = float(wireless["radius_m"])
     distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
@@ -1008,7 +1005,6 @@ def proposed_algorithm(
     seed = int(cfg["seed"] if seed is None else seed)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    model_bits_floor = int(train_cfg.get("model_bits_floor", 1024))
     eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
     regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
     min_distance = float(wireless.get("min_distance_m", 5.0))
@@ -1036,7 +1032,7 @@ def proposed_algorithm(
     if isinstance(model, type):
         model = model()
     if model_bits is None:
-        model_bits = max(model_bits_floor, int(sum(parameter.numel() for parameter in model.parameters()) * train_cfg["quantization_bits"]))
+        model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
 
     radius = float(wireless["radius_m"])
     distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
@@ -1319,8 +1315,6 @@ def load_yaml(path=None):
         },
         "training": {
             "device": "auto",
-            "quantization_bits": 1,
-            "model_bits_floor": 1024,
             "eval_batch_size": 256,
             "regression_loss": "nmse",
             "regression_scale_floor": 1e-12,

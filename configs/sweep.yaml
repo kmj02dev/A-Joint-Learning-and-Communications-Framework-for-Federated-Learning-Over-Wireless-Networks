@@ -17,8 +17,6 @@ wireless:
   heuristic_max_rbs: [20]
 
 training:
-  quantization_bits: [1]
-  model_bits_floor: [1024]
   eval_batch_size: [256]
   regression_scale_floor: [1.0e-12]
 
