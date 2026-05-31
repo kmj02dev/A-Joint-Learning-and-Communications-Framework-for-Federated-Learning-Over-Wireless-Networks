@@ -1,16 +1,17 @@
 # Runtime override consumed by main.py. Values under figures may be scalars
 # or lists. Lists define the experiment candidates to run from this YAML.
+seed: [0, 42]
 figures:
   figure_3:
     # Fig. 3 does not state the exact number of red-cross regression samples.
     data_count: [50]
     test_count: [1000]
-    rounds: [10, 30, 50, 130]
+    rounds: [10, 50, 130]
     num_rbs: [3, 6, 9, 12, 15]
     local_epochs: [1]
     batch_size: [32]
-    activation: [identity, relu]
-    learning_rate: [0.01, 0.1]
+    activation: [identity]
+    learning_rate: [0.01]
   figure_4:
     # sample_counts is itself a list-valued parameter, so use list-of-lists.
     sample_counts:

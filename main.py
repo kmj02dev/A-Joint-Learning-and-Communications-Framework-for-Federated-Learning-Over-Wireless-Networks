@@ -939,6 +939,7 @@ def proposed_algorithm(
     device=None,
     learning_rate=None,
     model_bits=None,
+    resource_search="hungarian",
 ):
     """Run the paper's wireless-aware user/RB/power selection, optionally followed by FedAvg."""
     cfg = load_yaml() if config is None else config
@@ -1032,17 +1033,61 @@ def proposed_algorithm(
             energies[user_idx, rb_idx] = energy
             feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
 
+    resource_search = str(resource_search)
     weights = np.where(feasible, counts[:, None] * (packet_errors - 1.0), 0.0)
     allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
     selected_users = []
     assigned_rbs = []
-    solver_iterations = int(num_users * num_rbs)
-    rows, cols = linear_sum_assignment(weights)
-    for row, col in zip(rows, cols):
-        if feasible[row, col] and weights[row, col] < 0.0:
-            allocation[row, col] = 1
-            selected_users.append(int(row))
-            assigned_rbs.append(int(col))
+    if resource_search == "hungarian":
+        solver_iterations = int(num_users * num_rbs)
+        rows, cols = linear_sum_assignment(weights)
+        for row, col in zip(rows, cols):
+            if feasible[row, col] and weights[row, col] < 0.0:
+                allocation[row, col] = 1
+                selected_users.append(int(row))
+                assigned_rbs.append(int(col))
+    elif resource_search == "heuristic":
+        if num_rbs > 20:
+            raise ValueError("heuristic resource search supports up to 20 RBs")
+        memo = {}
+        choices = {}
+
+        def search_assignment(user_idx, used_mask):
+            key = (user_idx, used_mask)
+            if key in memo:
+                return memo[key]
+            if user_idx >= num_users:
+                memo[key] = 0.0
+                choices[key] = -1
+                return 0.0
+
+            best_cost = search_assignment(user_idx + 1, used_mask)
+            best_rb = -1
+            for rb_idx in range(num_rbs):
+                bit = 1 << rb_idx
+                if used_mask & bit:
+                    continue
+                if feasible[user_idx, rb_idx] and weights[user_idx, rb_idx] < 0.0:
+                    candidate = weights[user_idx, rb_idx] + search_assignment(user_idx + 1, used_mask | bit)
+                    if candidate < best_cost:
+                        best_cost = candidate
+                        best_rb = rb_idx
+            memo[key] = best_cost
+            choices[key] = best_rb
+            return best_cost
+
+        search_assignment(0, 0)
+        solver_iterations = len(memo)
+        used_mask = 0
+        for user_idx in range(num_users):
+            rb_idx = choices.get((user_idx, used_mask), -1)
+            if rb_idx >= 0:
+                allocation[user_idx, rb_idx] = 1
+                selected_users.append(int(user_idx))
+                assigned_rbs.append(int(rb_idx))
+                used_mask |= 1 << rb_idx
+    else:
+        raise ValueError(f"Unsupported resource search method: {resource_search}")
 
     selected_users = np.array(selected_users, dtype=np.int64)
     assigned_rbs = np.array(assigned_rbs, dtype=np.int64)
@@ -1132,7 +1177,8 @@ def proposed_algorithm(
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
 
     return {
-        "scheme": "proposed",
+        "scheme": "proposed" if resource_search == "hungarian" else "optimal_fl",
+        "resource_search": resource_search,
         "allocation": allocation,
         "selected_users": selected_users,
         "assigned_rbs": assigned_rbs,
@@ -1265,7 +1311,28 @@ def figure_3(plot=False, seed=SEED, config=None):
             "batch_size": batch_size,
             "activation": activation,
             "learning_rate": learning_rate,
+            "optimal_resource_search": "heuristic",
         }
+    }
+    optimal = proposed_algorithm(
+        data["users"],
+        RegressionFNN(activation=activation),
+        task="regression",
+        test_data=test_data,
+        rounds=rounds,
+        num_rbs=num_rbs,
+        local_epochs=local_epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        resource_search="heuristic",
+        seed=seed,
+        config=config,
+    )
+    result["optimal"] = {
+        "loss": optimal["metrics"]["loss"][-1],
+        "selected": len(optimal["selected_users"]),
+        "solver_iterations": optimal["solver_iterations"],
+        "model_state": optimal["model_state"],
     }
     for name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}.items():
         output = runner(
@@ -1286,14 +1353,14 @@ def figure_3(plot=False, seed=SEED, config=None):
     xs = torch.linspace(0, 1, 100).reshape(-1, 1)
     with torch.no_grad():
         result["x_grid"] = xs.numpy().ravel()
-        result["ideal_prediction"] = (-2.0 * xs + 1.0).numpy().ravel()
+        result["noise_free_prediction"] = (-2.0 * xs + 1.0).numpy().ravel()
         result["samples"] = (data["x"].numpy().ravel(), data["y"].numpy().ravel())
-        result["ideal_loss"] = 0.0
     if plot:
         fig, ax = plt.subplots()
         ax.scatter(result["samples"][0], result["samples"][1], marker="x", color="red", label="Data samples")
         for key, label, color, linestyle, linewidth in [
             ("proposed", "Proposed algorithm", "blue", "-", 2.0),
+            ("optimal", "Optimal FL", "magenta", (0, (5, 5)), 2.0),
             ("baseline_a", "Baseline a)", "black", "-", 2.0),
             ("baseline_b", "Baseline b)", "limegreen", "-", 2.0),
         ]:
@@ -1302,17 +1369,14 @@ def figure_3(plot=False, seed=SEED, config=None):
             with torch.no_grad():
                 prediction = fitted(xs).numpy().ravel()
             ax.plot(result["x_grid"], prediction, color=color, linestyle=linestyle, linewidth=linewidth, label=label)
-        ax.plot(result["x_grid"], result["ideal_prediction"], color="magenta", linestyle=(0, (5, 5)), linewidth=2.0, label="Optimal FL")
         ax.set_xlabel("Input of the FL algorithm")
         ax.set_ylabel("Output of the FL algorithm")
         ax.set_xlim(0, 1)
         ax.set_ylim(-2, 2)
         ax.set_yticks(np.arange(-2, 3, 1))
-        handles, labels = ax.get_legend_handles_labels()
-        order = [0, 1, 4, 2, 3]
-        ax.legend([handles[index] for index in order], [labels[index] for index in order])
+        ax.legend()
         result["figure"] = fig
-    for key in ["proposed", "baseline_a", "baseline_b"]:
+    for key in ["proposed", "optimal", "baseline_a", "baseline_b"]:
         result[key].pop("model_state", None)
     return result
 
@@ -1634,11 +1698,12 @@ def main():
     parser.add_argument("--config", default=None)
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--output-dir", default="outputs")
-    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     config = load_yaml(args.config) if args.config else load_yaml()
-    config["seed"] = args.seed
+    if args.seed is not None:
+        config["seed"] = args.seed
     plt.rcParams.update(
         {
             "axes.edgecolor": "black",
@@ -1670,34 +1735,43 @@ def main():
         if key == "sample_counts" and (not value or not isinstance(value[0], list)):
             return [value]
         if not value:
-            raise ValueError(f"figures.figure_*.{key} must not be an empty list")
+            raise ValueError(f"{key} must not be an empty list")
         return value
 
     def figure_runs(name):
         figure_key = f"figure_{name}"
         figure_config = config.get("figures", {}).get(figure_key, {})
-        run_values = [({}, {})]
+        seed_source = config.get("seed", SEED)
+        seed_values = candidate_values("seed", seed_source)
+        run_values = []
+        for seed_value in seed_values:
+            filename_settings = {"seed": int(seed_value)} if isinstance(seed_source, list) else {}
+            varied = {"seed": int(seed_value)} if len(seed_values) > 1 else {}
+            run_values.append(({}, varied, filename_settings, int(seed_value)))
         for key, value in figure_config.items():
             values = candidate_values(key, value)
             next_run_values = []
-            for existing, varied in run_values:
+            for existing, varied, filename_settings, seed_value in run_values:
                 for candidate in values:
                     updated = dict(existing)
                     updated[key] = candidate
                     updated_varied = dict(varied)
                     if len(values) > 1:
                         updated_varied[key] = candidate
-                    next_run_values.append((updated, updated_varied))
+                    updated_filename_settings = dict(filename_settings)
+                    if isinstance(value, list):
+                        updated_filename_settings[key] = candidate
+                    next_run_values.append((updated, updated_varied, updated_filename_settings, seed_value))
             run_values = next_run_values
 
         runs = []
-        for values, varied in run_values:
+        for values, varied, filename_settings, seed_value in run_values:
             run_config = copy.deepcopy(config)
             run_config.setdefault("figures", {}).setdefault(figure_key, {})
             run_config["figures"][figure_key].update(values)
-            run_config["seed"] = args.seed
-            runs.append((run_config, varied))
-        return runs or [(copy.deepcopy(config), {})]
+            run_config["seed"] = seed_value
+            runs.append((run_config, varied, filename_settings))
+        return runs or [(copy.deepcopy(config), {}, {})]
 
     def value_token(value):
         if isinstance(value, list):
@@ -1740,19 +1814,16 @@ def main():
 
     for name, func in selected.items():
         runs = planned[name]
-        multiple_runs = len(runs) > 1
-        for run_index, (run_config, varied) in enumerate(runs, start=1):
-            result = func(plot=True, seed=args.seed, config=run_config)
+        for run_index, (run_config, varied, filename_settings) in enumerate(runs, start=1):
+            run_seed = int(run_config.get("seed", SEED))
+            result = func(plot=True, seed=run_seed, config=run_config)
             save_path = None
             if "figure" in result:
                 fig = result["figure"]
                 format_figure(fig, name)
-                if multiple_runs:
-                    save_dir = output_dir / f"figure_{name}"
-                    save_dir.mkdir(parents=True, exist_ok=True)
-                    save_path = save_dir / f"{run_index:03d}_{run_token(varied)}.png"
-                else:
-                    save_path = output_dir / f"figure_{name}.png"
+                save_dir = output_dir / f"figure_{name}"
+                save_dir.mkdir(parents=True, exist_ok=True)
+                save_path = save_dir / f"{run_index:03d}_{run_token(filename_settings)}.png"
                 fig.savefig(save_path, dpi=200, bbox_inches="tight")
                 plt.close(fig)
 
