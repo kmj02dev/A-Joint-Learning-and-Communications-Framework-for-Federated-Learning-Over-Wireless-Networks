@@ -74,9 +74,9 @@ figures:
     # Theorem 1 constants are not specified by the paper or FLMIN.m.
     strong_convexity_mu: [0.1]
     lipschitz_l: [1.0]
-    gradient_bound_zeta1: [1.0]
-    gradient_bound_zeta2: [0.5]
-    average_seeds: [0, 42, 1004]
+    gradient_bound_zeta1: [4.225]
+    gradient_bound_zeta2: [0.480]
+    average_seeds: [76, 125, 93]
   figure_7:
     # FLMIN.m datanumber values for the 15-user MNIST FNN experiment.
     samples_per_user:
