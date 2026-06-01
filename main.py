@@ -1461,6 +1461,7 @@ def load_yaml(path=None):
                 "model_parameters": 39760,
                 "waterfall_threshold": 1.08,
                 "simulation_trials": 2000,
+                "fl_simulation_trials": 3,
                 "rounds": 130,
                 "local_epochs": 1,
                 "activation": "tanh",
@@ -1853,6 +1854,7 @@ def figure_6(plot=False, seed=SEED, config=None):
     model_parameters = int(first_candidate(figure_cfg.get("model_parameters", 39760)))
     quantization_bits = int(first_candidate(figure_cfg.get("quantization_bits", train_cfg.get("quantization_bits", 16))))
     simulation_trials = int(first_candidate(figure_cfg.get("simulation_trials", 2000)))
+    fl_simulation_trials = int(first_candidate(figure_cfg.get("fl_simulation_trials", 3)))
     rounds = int(first_candidate(figure_cfg.get("rounds", 130)))
     local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
     activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
@@ -1875,6 +1877,8 @@ def figure_6(plot=False, seed=SEED, config=None):
     threshold = float(first_candidate(figure_cfg.get("waterfall_threshold", wireless["waterfall_threshold"])))
     if simulation_trials <= 0:
         raise ValueError("figure_6.simulation_trials must be positive")
+    if fl_simulation_trials <= 0:
+        raise ValueError("figure_6.fl_simulation_trials must be positive")
     if mu <= 0.0 or lipschitz <= 0.0:
         raise ValueError("figure_6 strong_convexity_mu and lipschitz_l must be positive")
 
@@ -1953,7 +1957,7 @@ def figure_6(plot=False, seed=SEED, config=None):
             local_states = []
             local_weights = []
             for user_idx, packet_error in zip(selected_user_ids, selected_error_values):
-                if round_index > 0 and packet_rng.random() <= packet_error:
+                if packet_rng.random() <= packet_error:
                     continue
                 local_model = copy.deepcopy(global_model)
                 local_model.train()
@@ -1998,10 +2002,22 @@ def figure_6(plot=False, seed=SEED, config=None):
             gaps = contractions * gaps + increments
         return float(np.mean(gaps))
 
+    def run_fl_gap_trials(partitions, eval_dataset, gstar_loss, initial_state, selected_user_ids, selected_error_values, seed_base):
+        trial_gaps = []
+        trial_losses = []
+        for trial_index in range(fl_simulation_trials):
+            packet_rng = np.random.default_rng(seed_base + trial_index)
+            fl_model = run_measured_wireless_fl(partitions, initial_state, selected_user_ids, selected_error_values, packet_rng)
+            wireless_loss = evaluate_regression(fl_model, eval_dataset)
+            trial_losses.append(wireless_loss)
+            trial_gaps.append(wireless_loss - gstar_loss)
+        return float(np.mean(trial_gaps)), float(np.std(trial_gaps)), float(np.mean(trial_losses))
+
     fixed_total_count = int(np.sum(samples_per_user[: max(users)]))
     theoretical_by_seed = []
-    simulated_by_seed = []
-    measured_model_gap_by_mode = {mode: [] for mode in gstar_modes}
+    bound_simulated_by_seed = []
+    fl_simulation_gap_by_mode = {mode: [] for mode in gstar_modes}
+    fl_simulation_gap_std_by_mode = {mode: [] for mode in gstar_modes}
     central_loss_by_mode = {mode: [] for mode in gstar_modes}
     wireless_loss_by_mode = {mode: [] for mode in gstar_modes}
     selected_by_seed = []
@@ -2018,8 +2034,9 @@ def figure_6(plot=False, seed=SEED, config=None):
         fixed_central_model = train_central_model(fixed_dataset, initial_state)
         fixed_central_loss = evaluate_regression(fixed_central_model, fixed_dataset)
         theoretical_seed = []
-        simulated_seed = []
-        measured_model_gap_seed_by_mode = {mode: [] for mode in gstar_modes}
+        bound_simulated_seed = []
+        fl_simulation_gap_seed_by_mode = {mode: [] for mode in gstar_modes}
+        fl_simulation_gap_std_seed_by_mode = {mode: [] for mode in gstar_modes}
         central_loss_seed_by_mode = {mode: [] for mode in gstar_modes}
         wireless_loss_seed_by_mode = {mode: [] for mode in gstar_modes}
         selected_seed = []
@@ -2059,13 +2076,20 @@ def figure_6(plot=False, seed=SEED, config=None):
             selected_seed.append(len(selected_users))
             miss_ratio_seed.append(miss_ratio)
             packet_rng = np.random.default_rng(average_seed * 1000003 + user_count * 7919 + 101)
-            simulated_seed.append(simulate_packet_error_bound(counts, selected_users_array, selected_errors, packet_rng))
+            bound_simulated_seed.append(simulate_packet_error_bound(counts, selected_users_array, selected_errors, packet_rng))
 
             if "fixed_total" in gstar_modes:
-                packet_rng = np.random.default_rng(average_seed * 1000003 + user_count * 9176 + 11)
-                fl_model = run_measured_wireless_fl(fixed_partitions[:user_count], initial_state, selected_users_array, selected_errors, packet_rng)
-                wireless_loss = evaluate_regression(fl_model, fixed_dataset)
-                measured_model_gap_seed_by_mode["fixed_total"].append(max(0.0, wireless_loss - fixed_central_loss))
+                gap_mean, gap_std, wireless_loss = run_fl_gap_trials(
+                    fixed_partitions[:user_count],
+                    fixed_dataset,
+                    fixed_central_loss,
+                    initial_state,
+                    selected_users_array,
+                    selected_errors,
+                    average_seed * 1000003 + user_count * 9176 + 11,
+                )
+                fl_simulation_gap_seed_by_mode["fixed_total"].append(gap_mean)
+                fl_simulation_gap_std_seed_by_mode["fixed_total"].append(gap_std)
                 central_loss_seed_by_mode["fixed_total"].append(fixed_central_loss)
                 wireless_loss_seed_by_mode["fixed_total"].append(wireless_loss)
 
@@ -2076,30 +2100,40 @@ def figure_6(plot=False, seed=SEED, config=None):
                 iid_partitions = get_partitioned_data(iid_dataset, num_users=user_count, samples_per_user=counts.astype(int).tolist(), seed=iid_seed)
                 iid_central_model = train_central_model(iid_dataset, initial_state)
                 iid_central_loss = evaluate_regression(iid_central_model, iid_dataset)
-                packet_rng = np.random.default_rng(iid_seed + 37)
-                fl_model = run_measured_wireless_fl(iid_partitions, initial_state, selected_users_array, selected_errors, packet_rng)
-                wireless_loss = evaluate_regression(fl_model, iid_dataset)
-                measured_model_gap_seed_by_mode["iid_partition"].append(max(0.0, wireless_loss - iid_central_loss))
+                gap_mean, gap_std, wireless_loss = run_fl_gap_trials(
+                    iid_partitions,
+                    iid_dataset,
+                    iid_central_loss,
+                    initial_state,
+                    selected_users_array,
+                    selected_errors,
+                    iid_seed + 37,
+                )
+                fl_simulation_gap_seed_by_mode["iid_partition"].append(gap_mean)
+                fl_simulation_gap_std_seed_by_mode["iid_partition"].append(gap_std)
                 central_loss_seed_by_mode["iid_partition"].append(iid_central_loss)
                 wireless_loss_seed_by_mode["iid_partition"].append(wireless_loss)
         theoretical_by_seed.append(theoretical_seed)
-        simulated_by_seed.append(simulated_seed)
+        bound_simulated_by_seed.append(bound_simulated_seed)
         for mode in gstar_modes:
-            measured_model_gap_by_mode[mode].append(measured_model_gap_seed_by_mode[mode])
+            fl_simulation_gap_by_mode[mode].append(fl_simulation_gap_seed_by_mode[mode])
+            fl_simulation_gap_std_by_mode[mode].append(fl_simulation_gap_std_seed_by_mode[mode])
             central_loss_by_mode[mode].append(central_loss_seed_by_mode[mode])
             wireless_loss_by_mode[mode].append(wireless_loss_seed_by_mode[mode])
         selected_by_seed.append(selected_seed)
         miss_ratio_by_seed.append(miss_ratio_seed)
     theoretical = np.mean(theoretical_by_seed, axis=0).tolist()
-    simulated = np.mean(simulated_by_seed, axis=0).tolist()
-    measured_model_gap = {mode: np.mean(values, axis=0).tolist() for mode, values in measured_model_gap_by_mode.items()}
+    bound_simulated = np.mean(bound_simulated_by_seed, axis=0).tolist()
+    fl_simulation_gap = {mode: np.mean(values, axis=0).tolist() for mode, values in fl_simulation_gap_by_mode.items()}
+    fl_simulation_gap_std = {mode: np.mean(values, axis=0).tolist() for mode, values in fl_simulation_gap_std_by_mode.items()}
     central_losses = {mode: np.mean(values, axis=0).tolist() for mode, values in central_loss_by_mode.items()}
     wireless_losses = {mode: np.mean(values, axis=0).tolist() for mode, values in wireless_loss_by_mode.items()}
     result = {
         "users": users,
         "theoretical_gap": theoretical,
-        "simulation_gap": simulated,
-        "measured_model_gap": measured_model_gap,
+        "simulation_gap": fl_simulation_gap,
+        "fl_simulation_gap_std": fl_simulation_gap_std,
+        "bound_simulation_gap": bound_simulated,
         "central_loss": central_losses,
         "wireless_loss": wireless_losses,
         "selected_users": np.mean(selected_by_seed, axis=0).tolist(),
@@ -2113,6 +2147,7 @@ def figure_6(plot=False, seed=SEED, config=None):
             "model_megabits": model_megabits,
             "waterfall_threshold": threshold,
             "simulation_trials": simulation_trials,
+            "fl_simulation_trials": fl_simulation_trials,
             "rounds": rounds,
             "local_epochs": local_epochs,
             "activation": activation,
@@ -2132,11 +2167,19 @@ def figure_6(plot=False, seed=SEED, config=None):
     if plot:
         fig, ax = plt.subplots()
         ax.plot(users, theoretical, color="blue", marker="o", linewidth=2.5, label="Theoretical analysis")
-        ax.plot(users, simulated, color="black", marker="s", linestyle=(0, (6, 4)), linewidth=2.5, label="Simulation result")
+        ax.plot(users, bound_simulated, color="black", marker="s", linestyle=(0, (6, 4)), linewidth=2.5, label="Bound simulation")
+        styles = {
+            "fixed_total": ("red", "^", ":", "FL simulation (fixed total data)"),
+            "iid_partition": ("green", "d", (0, (3, 3, 1, 3)), "FL simulation (IID partition)"),
+        }
+        for mode in gstar_modes:
+            color, marker, linestyle, label = styles[mode]
+            ax.plot(users, fl_simulation_gap[mode], color=color, marker=marker, linestyle=linestyle, linewidth=2.0, label=label)
         ax.set_xlabel("Number of users")
         ax.set_ylabel("Convergence gap due to wireless factors")
         ax.set_xticks(users)
-        ax.set_yticks(np.arange(0, math.ceil(max(max(theoretical), max(simulated)) / 5) * 5 + 5, 5))
+        simulation_values = [value for values in fl_simulation_gap.values() for value in values]
+        ax.set_yticks(np.arange(0, math.ceil(max(max(theoretical), max(bound_simulated), max(simulation_values)) / 5) * 5 + 5, 5))
         ax.legend()
         result["figure"] = fig
     return result
