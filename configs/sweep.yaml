@@ -53,6 +53,30 @@ figures:
     batch_size: [50]
     activation: [identity]
     learning_rate: [0.01]
+    average_seeds: [0, 42, 1004]
+  figure_5:
+    user_counts:
+      - [3, 6, 10, 15, 20, 25]
+    rb_counts:
+      - [10, 15]
+    average_seeds: [0, 42, 1004]
+  figure_6:
+    user_counts:
+      - [3, 6, 9, 12, 15, 18]
+    num_rbs: [12]
+    # FLMIN.m datanumber prefix values; Fig. 6 varies the total number of users.
+    samples_per_user:
+      - [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100, 200, 300, 400]
+    # FLMIN.m uses Z = 39760 * 16 bits.
+    model_parameters: [39760]
+    waterfall_threshold: [1.08]
+    simulation_trials: [130]
+    # Theorem 1 constants are not specified by the paper or FLMIN.m.
+    strong_convexity_mu: [0.1]
+    lipschitz_l: [1.0]
+    gradient_bound_zeta1: [1.0]
+    gradient_bound_zeta2: [0.5]
+    average_seeds: [0, 42, 1004]
   figure_7:
     # FLMIN.m datanumber values for the 15-user MNIST FNN experiment.
     samples_per_user:
@@ -74,6 +98,19 @@ figures:
     test_samples: [1000]
     rounds: [130]
     num_rbs: [12]
+    local_epochs: [1]
+    batch_size: [32]
+    learning_rate: [0.08]
+    # FLMIN.m averages three independent FL implementations.
+    average_seeds: [0, 42, 1004]
+  figure_9:
+    rb_counts:
+      - [3, 6, 9, 12]
+    # FLMIN.m datanumber values for the 15-user MNIST FNN experiment.
+    samples_per_user:
+      - [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100]
+    test_samples: [1000]
+    rounds: [130]
     local_epochs: [1]
     batch_size: [32]
     learning_rate: [0.08]

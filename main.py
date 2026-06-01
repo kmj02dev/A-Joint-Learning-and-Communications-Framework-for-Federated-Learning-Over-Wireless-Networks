@@ -1447,6 +1447,25 @@ def load_yaml(path=None):
                 "batch_size": 32,
                 "activation": "tanh",
                 "learning_rate": 0.01,
+                "average_seeds": [0, 42, 1004],
+            },
+            "figure_5": {
+                "user_counts": [3, 6, 10, 15, 20, 25],
+                "rb_counts": [10, 15],
+                "average_seeds": [0, 42, 1004],
+            },
+            "figure_6": {
+                "user_counts": [3, 6, 9, 12, 15, 18],
+                "num_rbs": 12,
+                "samples_per_user": [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100, 200, 300, 400],
+                "model_parameters": 39760,
+                "waterfall_threshold": 1.08,
+                "simulation_trials": 130,
+                "strong_convexity_mu": 0.1,
+                "lipschitz_l": 1.0,
+                "gradient_bound_zeta1": 1.0,
+                "gradient_bound_zeta2": 0.5,
+                "average_seeds": [0, 42, 1004],
             },
             "figure_7": {
                 "samples_per_user": [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100],
@@ -1456,6 +1475,7 @@ def load_yaml(path=None):
                 "local_epochs": 1,
                 "batch_size": 32,
                 "learning_rate": 0.08,
+                "average_seeds": [0, 42, 1004],
             },
             "figure_8": {
                 "user_counts": [3, 6, 9, 12, 15, 18],
@@ -1466,6 +1486,17 @@ def load_yaml(path=None):
                 "local_epochs": 1,
                 "batch_size": 32,
                 "learning_rate": 0.08,
+                "average_seeds": [0, 42, 1004],
+            },
+            "figure_9": {
+                "rb_counts": [3, 6, 9, 12],
+                "samples_per_user": [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100],
+                "test_samples": 1000,
+                "rounds": 130,
+                "local_epochs": 1,
+                "batch_size": 32,
+                "learning_rate": 0.08,
+                "average_seeds": [0, 42, 1004],
             },
         },
     }
@@ -1634,43 +1665,58 @@ def figure_4(plot=False, seed=SEED, config=None):
         raise ValueError("regression_loss must be 'mse' or 'nmse'")
     run_config = copy.deepcopy(cfg)
     run_config.setdefault("training", {})["regression_loss"] = regression_loss
-    data_seed_rng = np.random.default_rng(seed)
-    data_seeds = [int(data_seed_rng.integers(0, 2**32 - 1)) for _ in sample_counts]
-    curves = {"proposed": [], "baseline_a": [], "baseline_b": []}
-    for count, data_seed in zip(sample_counts, data_seeds):
-        data = generate_synthetic_data(num_users=15, samples_per_user=count, seed=data_seed, noise_std=noise_std)
-        train_data = TensorDataset(data["x"], data["y"])
-        torch.manual_seed(seed)
-        initial_model = RegressionFNN(activation=activation)
-        initial_state = {name: value.detach().clone() for name, value in initial_model.state_dict().items()}
-        for curve_name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}.items():
-            model_instance = RegressionFNN(activation=activation)
-            model_instance.load_state_dict(copy.deepcopy(initial_state))
-            output = runner(
-                data["users"],
-                model_instance,
-                task="regression",
-                test_data=train_data,
-                rounds=rounds,
-                num_rbs=num_rbs,
-                local_epochs=local_epochs,
-                batch_size=batch_size,
-                learning_rate=learning_rate,
-                seed=seed,
-                config=run_config,
-            )
-            fitted = RegressionFNN(activation=activation)
-            fitted.load_state_dict(output["model_state"])
-            fitted.eval()
-            display_loss = 0.0
-            display_total = 0
-            with torch.no_grad():
-                for features, labels in DataLoader(train_data, batch_size=eval_batch_size, shuffle=False):
-                    prediction = fitted(features)
-                    target = labels.float().reshape_as(prediction)
-                    display_loss += float((prediction - target).pow(2).sum().item())
-                    display_total += len(features)
-            curves[curve_name].append(display_loss / max(display_total, 1))
+    average_seeds_raw = figure_cfg.get("average_seeds", [seed])
+    if isinstance(average_seeds_raw, list) and average_seeds_raw and isinstance(average_seeds_raw[0], list):
+        average_seeds_raw = average_seeds_raw[0]
+    average_seeds = [int(value) for value in average_seeds_raw]
+    if not average_seeds:
+        raise ValueError("figure_4.average_seeds must not be empty")
+
+    curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": []}
+    data_seeds_by_seed = {}
+    runners = {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}
+    for average_seed in average_seeds:
+        data_seed_rng = np.random.default_rng(average_seed)
+        data_seeds = [int(data_seed_rng.integers(0, 2**32 - 1)) for _ in sample_counts]
+        data_seeds_by_seed[int(average_seed)] = data_seeds
+        seed_curves = {name: [] for name in curves_by_seed}
+        for count, data_seed in zip(sample_counts, data_seeds):
+            data = generate_synthetic_data(num_users=15, samples_per_user=count, seed=data_seed, noise_std=noise_std)
+            train_data = TensorDataset(data["x"], data["y"])
+            torch.manual_seed(average_seed)
+            initial_model = RegressionFNN(activation=activation)
+            initial_state = {name: value.detach().clone() for name, value in initial_model.state_dict().items()}
+            for curve_name, runner in runners.items():
+                model_instance = RegressionFNN(activation=activation)
+                model_instance.load_state_dict(copy.deepcopy(initial_state))
+                output = runner(
+                    data["users"],
+                    model_instance,
+                    task="regression",
+                    test_data=train_data,
+                    rounds=rounds,
+                    num_rbs=num_rbs,
+                    local_epochs=local_epochs,
+                    batch_size=batch_size,
+                    learning_rate=learning_rate,
+                    seed=average_seed,
+                    config=run_config,
+                )
+                fitted = RegressionFNN(activation=activation)
+                fitted.load_state_dict(output["model_state"])
+                fitted.eval()
+                display_loss = 0.0
+                display_total = 0
+                with torch.no_grad():
+                    for features, labels in DataLoader(train_data, batch_size=eval_batch_size, shuffle=False):
+                        prediction = fitted(features)
+                        target = labels.float().reshape_as(prediction)
+                        display_loss += float((prediction - target).pow(2).sum().item())
+                        display_total += len(features)
+                seed_curves[curve_name].append(display_loss / max(display_total, 1))
+        for curve_name, values in seed_curves.items():
+            curves_by_seed[curve_name].append(values)
+    curves = {name: np.mean(values, axis=0).tolist() for name, values in curves_by_seed.items()}
     result = {
         "samples_per_user": sample_counts,
         "loss": curves,
@@ -1687,7 +1733,9 @@ def figure_4(plot=False, seed=SEED, config=None):
             "loss_function": "mse",
             "loss_source": "training_mse_after_training",
             "data_sampling": "independent_per_count",
-            "data_seeds": data_seeds,
+            "data_seeds_by_seed": data_seeds_by_seed,
+            "average_seeds": average_seeds,
+            "average_runs": len(average_seeds),
         },
     }
     if plot:
@@ -1709,54 +1757,224 @@ def figure_4(plot=False, seed=SEED, config=None):
 
 
 def figure_5(plot=False, seed=SEED, config=None):
-    users = [3, 6, 10, 15, 20, 25]
-    curves = {10: [], 15: []}
-    timings = {10: [], 15: []}
-    for rb_count in curves:
-        for user_count in users:
-            started = time.perf_counter()
-            output = proposed_algorithm(num_users=user_count, num_rbs=rb_count, seed=seed, config=config)
-            timings[rb_count].append(time.perf_counter() - started)
-            curves[rb_count].append(output["solver_iterations"])
-    result = {"users": users, "edge_weight_evaluations": curves, "seconds": timings}
+    cfg = load_yaml() if config is None else config
+    figure_cfg = cfg.get("figures", {}).get("figure_5", {})
+
+    def first_candidate(value):
+        if isinstance(value, list):
+            if not value:
+                raise ValueError("Figure configuration candidate lists must not be empty")
+            return value[0]
+        return value
+
+    users_raw = figure_cfg.get("user_counts", [3, 6, 10, 15, 20, 25])
+    if isinstance(users_raw, list) and users_raw and isinstance(users_raw[0], list):
+        users_raw = users_raw[0]
+    users = [int(value) for value in users_raw]
+    rb_counts_raw = figure_cfg.get("rb_counts", [10, 15])
+    if isinstance(rb_counts_raw, list) and rb_counts_raw and isinstance(rb_counts_raw[0], list):
+        rb_counts_raw = rb_counts_raw[0]
+    rb_counts = [int(value) for value in rb_counts_raw]
+    average_seeds_raw = figure_cfg.get("average_seeds", [seed])
+    if isinstance(average_seeds_raw, list) and average_seeds_raw and isinstance(average_seeds_raw[0], list):
+        average_seeds_raw = average_seeds_raw[0]
+    average_seeds = [int(value) for value in average_seeds_raw]
+    if not average_seeds:
+        raise ValueError("figure_5.average_seeds must not be empty")
+
+    curves_by_seed = {rb_count: [] for rb_count in rb_counts}
+    timings_by_seed = {rb_count: [] for rb_count in rb_counts}
+    for average_seed in average_seeds:
+        for rb_count in rb_counts:
+            seed_curve = []
+            seed_timings = []
+            for user_count in users:
+                started = time.perf_counter()
+                output = proposed_algorithm(num_users=user_count, num_rbs=rb_count, seed=average_seed, config=cfg)
+                seed_timings.append(time.perf_counter() - started)
+                seed_curve.append(output["solver_iterations"])
+            curves_by_seed[rb_count].append(seed_curve)
+            timings_by_seed[rb_count].append(seed_timings)
+    curves = {rb_count: np.mean(values, axis=0).tolist() for rb_count, values in curves_by_seed.items()}
+    timings = {rb_count: np.mean(values, axis=0).tolist() for rb_count, values in timings_by_seed.items()}
+    result = {
+        "users": users,
+        "edge_weight_evaluations": curves,
+        "seconds": timings,
+        "hyperparameters": {"user_counts": users, "rb_counts": rb_counts, "average_seeds": average_seeds, "average_runs": len(average_seeds)},
+    }
     if plot:
         fig, ax = plt.subplots()
-        ax.plot(users, curves[10], color="blue", marker="o", linewidth=2.5, label=r"$R=10$")
-        ax.plot(users, curves[15], color="black", marker="s", linestyle=(0, (6, 4)), linewidth=2.5, label=r"$R=15$")
+        colors = ["blue", "black", "red", "green"]
+        markers = ["o", "s", "^", "d"]
+        for idx, rb_count in enumerate(rb_counts):
+            linestyle = "-" if idx == 0 else (0, (6, 4))
+            ax.plot(users, curves[rb_count], color=colors[idx % len(colors)], marker=markers[idx % len(markers)], linestyle=linestyle, linewidth=2.5, label=rf"$R={rb_count}$")
         ax.set_xlabel("Number of users")
         ax.set_ylabel("Number of iterations")
-        ax.set_yticks(np.arange(0, math.ceil(max(max(curves[10]), max(curves[15])) / 20) * 20 + 20, 20))
+        curve_values = [value for values in curves.values() for value in values]
+        ax.set_yticks(np.arange(0, math.ceil(max(curve_values) / 20) * 20 + 20, 20))
         ax.legend()
         result["figure"] = fig
     return result
 
 
 def figure_6(plot=False, seed=SEED, config=None):
-    users = [3, 6, 9, 12, 15, 18]
-    theoretical = []
-    simulated = []
-    for user_count in users:
-        output = proposed_algorithm(num_users=user_count, num_rbs=12, seed=seed, config=config)
-        counts = output["counts"]
-        selected = set(output["selected_users"].tolist())
-        miss_terms = []
-        for user_idx in range(user_count):
-            if user_idx in selected:
-                rb_idx = int(output["assigned_rbs"][np.where(output["selected_users"] == user_idx)[0][0]])
-                miss_terms.append(counts[user_idx] * output["packet_errors"][user_idx, rb_idx])
+    cfg = load_yaml() if config is None else config
+    figure_cfg = cfg.get("figures", {}).get("figure_6", {})
+    wireless = cfg["wireless"]
+    train_cfg = cfg["training"]
+
+    def first_candidate(value):
+        if isinstance(value, list):
+            if not value:
+                raise ValueError("Figure configuration candidate lists must not be empty")
+            return value[0]
+        return value
+
+    users_raw = figure_cfg.get("user_counts", [3, 6, 9, 12, 15, 18])
+    if isinstance(users_raw, list) and users_raw and isinstance(users_raw[0], list):
+        users_raw = users_raw[0]
+    users = [int(value) for value in users_raw]
+    num_rbs = int(first_candidate(figure_cfg.get("num_rbs", 12)))
+    samples_raw = figure_cfg.get("samples_per_user", wireless["ki_cycle"])
+    if isinstance(samples_raw, list) and samples_raw and isinstance(samples_raw[0], list):
+        samples_raw = samples_raw[0]
+    samples_per_user = [int(value) for value in samples_raw]
+    if len(samples_per_user) < max(users):
+        raise ValueError("figure_6.samples_per_user must contain at least max(user_counts) entries")
+    model_parameters = int(first_candidate(figure_cfg.get("model_parameters", 39760)))
+    quantization_bits = int(first_candidate(figure_cfg.get("quantization_bits", train_cfg.get("quantization_bits", 16))))
+    simulation_trials = int(first_candidate(figure_cfg.get("simulation_trials", 130)))
+    mu = float(first_candidate(figure_cfg.get("strong_convexity_mu", 0.1)))
+    lipschitz = float(first_candidate(figure_cfg.get("lipschitz_l", 1.0)))
+    zeta1 = float(first_candidate(figure_cfg.get("gradient_bound_zeta1", 1.0)))
+    zeta2 = float(first_candidate(figure_cfg.get("gradient_bound_zeta2", 0.5)))
+    threshold = float(first_candidate(figure_cfg.get("waterfall_threshold", wireless["waterfall_threshold"])))
+    if simulation_trials <= 0:
+        raise ValueError("figure_6.simulation_trials must be positive")
+    if mu <= 0.0 or lipschitz <= 0.0:
+        raise ValueError("figure_6 strong_convexity_mu and lipschitz_l must be positive")
+
+    interference_by_rbs = wireless.get("interference_w_by_rbs", {})
+    interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
+    if interference_profile is None and isinstance(interference_by_rbs, dict):
+        interference_profile = interference_by_rbs.get(num_rbs)
+    if interference_profile is None:
+        interference_profile = [float(wireless["interference_w"])] * num_rbs
+    interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
+    if interference.size != num_rbs:
+        raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
+
+    radius = float(wireless["radius_m"])
+    power = float(wireless["pmax_w"])
+    noise_w = 1e-14
+    downlink_interference = float(wireless["downlink_interference_w"])
+    downlink_bandwidth_mhz = float(wireless["downlink_bandwidth_hz"]) / 1e6
+    model_megabits = model_parameters * quantization_bits / 1024.0 / 1024.0
+    local_training_energy = (
+        float(wireless["energy_coefficient"])
+        * float(wireless["cpu_cycles_per_bit"])
+        * float(wireless["cpu_frequency_hz"]) ** 2
+        * model_megabits
+    )
+    delay_requirement = float(wireless["delay_s"])
+    energy_requirement = float(wireless["energy_j"])
+    average_seeds_raw = figure_cfg.get("average_seeds", [seed])
+    if isinstance(average_seeds_raw, list) and average_seeds_raw and isinstance(average_seeds_raw[0], list):
+        average_seeds_raw = average_seeds_raw[0]
+    average_seeds = [int(value) for value in average_seeds_raw]
+    if not average_seeds:
+        raise ValueError("figure_6.average_seeds must not be empty")
+
+    theoretical_by_seed = []
+    simulated_by_seed = []
+    selected_by_seed = []
+    miss_ratio_by_seed = []
+    for average_seed in average_seeds:
+        rng = np.random.default_rng(average_seed)
+        distance_pool = np.maximum(rng.random(max(users)) * radius, np.finfo(np.float64).tiny)
+        theoretical_seed = []
+        simulated_seed = []
+        selected_seed = []
+        miss_ratio_seed = []
+        for user_count in users:
+            counts = np.asarray(samples_per_user[:user_count], dtype=np.float64)
+            total = float(np.sum(counts))
+            distances = distance_pool[:user_count]
+            path_gain = distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+            denominator = interference[None, :] + noise_w
+            packet_errors = 1.0 - np.exp(-threshold * denominator / np.maximum(power * path_gain, np.finfo(np.float64).tiny))
+            packet_errors = np.clip(packet_errors, 0.0, 1.0)
+            uplink_rates = np.log2(1.0 + power * path_gain / np.maximum(denominator, np.finfo(np.float64).tiny))
+            downlink_rates = downlink_bandwidth_mhz * np.log2(
+                1.0 + distances ** (-float(wireless["path_loss_alpha"])) / max(downlink_interference, np.finfo(np.float64).tiny)
+            )
+            uplink_delays = model_megabits / np.maximum(uplink_rates, np.finfo(np.float64).tiny)
+            downlink_delays = model_megabits / np.maximum(downlink_rates, np.finfo(np.float64).tiny)
+            total_delays = uplink_delays + downlink_delays[:, None]
+            energies = local_training_energy + power * uplink_delays
+            feasible = (total_delays < delay_requirement) & (energies < energy_requirement)
+            weights = np.where(feasible, counts[:, None] * (packet_errors - 1.0), 0.0)
+            rows, cols = linear_sum_assignment(weights)
+            final_errors = np.ones(user_count, dtype=np.float64)
+            selected_users = []
+            for row, col in zip(rows, cols):
+                if feasible[row, col] and weights[row, col] < 0.0:
+                    final_errors[row] = packet_errors[row, col]
+                    selected_users.append(int(row))
+
+            miss_ratio = float(np.sum(counts * final_errors) / total)
+            contraction = 1.0 - mu / lipschitz + 4.0 * mu * zeta2 * miss_ratio / lipschitz
+            gap = (2.0 * zeta1 * miss_ratio / lipschitz) / max(1.0 - contraction, 1e-9)
+            theoretical_seed.append(gap)
+            selected_seed.append(len(selected_users))
+            miss_ratio_seed.append(miss_ratio)
+
+            trial_miss_ratios = []
+            selected_users = np.asarray(selected_users, dtype=np.int64)
+            if selected_users.size:
+                selected_errors = final_errors[selected_users]
+                for _ in range(simulation_trials):
+                    sampled_errors = np.ones(user_count, dtype=np.float64)
+                    successes = rng.random(selected_users.size) > selected_errors
+                    sampled_errors[selected_users[successes]] = 0.0
+                    trial_miss_ratios.append(float(np.sum(counts * sampled_errors) / total))
             else:
-                miss_terms.append(counts[user_idx])
-        miss_sum = float(np.sum(miss_terms))
-        total = float(np.sum(counts))
-        mu = 0.1
-        lipschitz = 1.0
-        zeta1 = 1.0
-        zeta2 = 0.01
-        contraction = 1.0 - mu / lipschitz + 4.0 * mu * zeta2 * miss_sum / (lipschitz * total)
-        gap = (2.0 * zeta1 * miss_sum / (lipschitz * total)) / max(1.0 - contraction, 1e-9)
-        theoretical.append(gap)
-        simulated.append(gap * (0.93 + 0.03 * (user_count % 3)))
-    result = {"users": users, "theoretical_gap": theoretical, "simulation_gap": simulated}
+                trial_miss_ratios.append(miss_ratio)
+            simulated_miss_ratio = float(np.mean(trial_miss_ratios))
+            simulated_contraction = 1.0 - mu / lipschitz + 4.0 * mu * zeta2 * simulated_miss_ratio / lipschitz
+            simulated_seed.append((2.0 * zeta1 * simulated_miss_ratio / lipschitz) / max(1.0 - simulated_contraction, 1e-9))
+        theoretical_by_seed.append(theoretical_seed)
+        simulated_by_seed.append(simulated_seed)
+        selected_by_seed.append(selected_seed)
+        miss_ratio_by_seed.append(miss_ratio_seed)
+    theoretical = np.mean(theoretical_by_seed, axis=0).tolist()
+    simulated = np.mean(simulated_by_seed, axis=0).tolist()
+    result = {
+        "users": users,
+        "theoretical_gap": theoretical,
+        "simulation_gap": simulated,
+        "selected_users": np.mean(selected_by_seed, axis=0).tolist(),
+        "miss_ratio": np.mean(miss_ratio_by_seed, axis=0).tolist(),
+        "hyperparameters": {
+            "user_counts": users,
+            "num_rbs": num_rbs,
+            "samples_per_user": samples_per_user[: max(users)],
+            "model_parameters": model_parameters,
+            "quantization_bits": quantization_bits,
+            "model_megabits": model_megabits,
+            "waterfall_threshold": threshold,
+            "simulation_trials": simulation_trials,
+            "strong_convexity_mu": mu,
+            "lipschitz_l": lipschitz,
+            "gradient_bound_zeta1": zeta1,
+            "gradient_bound_zeta2": zeta2,
+            "average_seeds": average_seeds,
+            "average_runs": len(average_seeds),
+            "wireless_model": "docs/Wireless-FL/FLMIN.m",
+        },
+    }
     if plot:
         fig, ax = plt.subplots()
         ax.plot(users, theoretical, color="blue", marker="o", linewidth=2.5, label="Theoretical analysis")
@@ -1951,23 +2169,75 @@ def figure_8(plot=False, seed=SEED, config=None):
 
 
 def figure_9(plot=False, seed=SEED, config=None):
-    rb_counts = [3, 6, 9, 12]
-    data = load_mnist_data(num_users=15, samples_per_user=[180, 150, 120, 60, 30] * 3, test_samples=800, seed=seed)
-    curves = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
-    for rb_count in rb_counts:
-        curves["proposed"].append(
-            proposed_algorithm(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed, config=config)["metrics"]["accuracy"][-1]
-        )
-        curves["baseline_a"].append(
-            baseline_a(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed, config=config)["metrics"]["accuracy"][-1]
-        )
-        curves["baseline_b"].append(
-            baseline_b(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed, config=config)["metrics"]["accuracy"][-1]
-        )
-        curves["baseline_c"].append(
-            baseline_c(data["users"], MNISTFNN, task="mnist", test_data=data["test"], rounds=30, num_rbs=rb_count, seed=seed, config=config)["metrics"]["accuracy"][-1]
-        )
-    result = {"rbs": rb_counts, "accuracy": curves}
+    cfg = load_yaml() if config is None else config
+    figure_cfg = cfg.get("figures", {}).get("figure_9", {})
+
+    def first_candidate(value):
+        if isinstance(value, list):
+            if not value:
+                raise ValueError("Figure configuration candidate lists must not be empty")
+            return value[0]
+        return value
+
+    rb_counts_raw = figure_cfg.get("rb_counts", [3, 6, 9, 12])
+    if isinstance(rb_counts_raw, list) and rb_counts_raw and isinstance(rb_counts_raw[0], list):
+        rb_counts_raw = rb_counts_raw[0]
+    rb_counts = [int(value) for value in rb_counts_raw]
+    samples_raw = figure_cfg.get("samples_per_user", [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100])
+    if isinstance(samples_raw, list) and samples_raw and isinstance(samples_raw[0], list):
+        samples_raw = samples_raw[0]
+    samples_per_user = [int(value) for value in samples_raw]
+    test_samples = int(first_candidate(figure_cfg.get("test_samples", 1000)))
+    rounds = int(first_candidate(figure_cfg.get("rounds", 130)))
+    local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
+    batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
+    learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["mnist_lr"])))
+    average_seeds_raw = figure_cfg.get("average_seeds", [seed])
+    if isinstance(average_seeds_raw, list) and average_seeds_raw and isinstance(average_seeds_raw[0], list):
+        average_seeds_raw = average_seeds_raw[0]
+    average_seeds = [int(value) for value in average_seeds_raw]
+    if not average_seeds:
+        raise ValueError("figure_9.average_seeds must not be empty")
+
+    curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
+    runners = {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b, "baseline_c": baseline_c}
+    for average_seed in average_seeds:
+        data = load_mnist_data(num_users=len(samples_per_user), samples_per_user=samples_per_user, test_samples=test_samples, seed=average_seed)
+        seed_curves = {name: [] for name in curves_by_seed}
+        for rb_count in rb_counts:
+            for name, runner in runners.items():
+                output = runner(
+                    data["users"],
+                    MNISTFNN,
+                    task="mnist",
+                    test_data=data["test"],
+                    rounds=rounds,
+                    num_rbs=rb_count,
+                    local_epochs=local_epochs,
+                    batch_size=batch_size,
+                    learning_rate=learning_rate,
+                    seed=average_seed,
+                    config=cfg,
+                )
+                seed_curves[name].append(output["metrics"]["accuracy"][-1])
+        for name, values in seed_curves.items():
+            curves_by_seed[name].append(values)
+    curves = {name: np.mean(values, axis=0).tolist() for name, values in curves_by_seed.items()}
+    result = {
+        "rbs": rb_counts,
+        "accuracy": curves,
+        "hyperparameters": {
+            "rb_counts": rb_counts,
+            "samples_per_user": samples_per_user,
+            "test_samples": test_samples,
+            "rounds": rounds,
+            "local_epochs": local_epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "average_seeds": average_seeds,
+            "average_runs": len(average_seeds),
+        },
+    }
     if plot:
         fig, ax = plt.subplots()
         ax.plot(rb_counts, curves["proposed"], color="black", linewidth=2.0, label="Proposed FL")
@@ -1977,9 +2247,12 @@ def figure_9(plot=False, seed=SEED, config=None):
         ax.set_xlabel("Number of RBs")
         ax.set_ylabel("Identification accuracy")
         ax.set_xlim(min(rb_counts), max(rb_counts))
-        ax.set_ylim(0.65, 0.92)
+        accuracy_values = [value for values in curves.values() for value in values]
+        y_min = math.floor(min(accuracy_values) / 0.02) * 0.02
+        y_max = math.ceil(max(accuracy_values) / 0.02) * 0.02
+        ax.set_ylim(y_min, y_max)
         ax.set_xticks(rb_counts)
-        ax.set_yticks(np.arange(0.66, 0.921, 0.02))
+        ax.set_yticks(np.arange(y_min, y_max + 0.01, 0.02))
         ax.legend()
         result["figure"] = fig
     return result
@@ -2070,6 +2343,8 @@ def main():
             return [value]
         if key.endswith("user_counts") and (not value or not isinstance(value[0], list)):
             return [value]
+        if key.endswith("rb_counts") and (not value or not isinstance(value[0], list)):
+            return [value]
         if key.endswith("average_seeds") and (not value or not isinstance(value[0], list)):
             return [value]
         if key.endswith("ki_cycle") and (not value or not isinstance(value[0], list)):
@@ -2145,6 +2420,9 @@ def main():
             raw = str(value)
         raw = raw.replace("-", "m").replace(".", "p")
         token = "".join(char if char.isalnum() else "_" for char in raw).strip("_")
+        if len(token) > 80:
+            checksum = sum((index + 1) * ord(char) for index, char in enumerate(token)) % 100000
+            token = f"{token[:56].rstrip('_')}_len{len(token)}_sum{checksum}"
         return token or "value"
 
     def key_token(key):
@@ -2154,7 +2432,11 @@ def main():
     def run_token(varied):
         if not varied:
             return "default"
-        return "_".join(f"{key_token(key)}_{value_token(value)}" for key, value in varied.items())
+        token = "_".join(f"{key_token(key)}_{value_token(value)}" for key, value in varied.items())
+        if len(token) > 180:
+            checksum = sum((index + 1) * ord(char) for index, char in enumerate(token)) % 100000
+            token = f"{token[:148].rstrip('_')}_len{len(token)}_sum{checksum}"
+        return token
 
     def format_figure(fig, name):
         for ax in fig.axes:
