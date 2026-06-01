@@ -1461,7 +1461,15 @@ def load_yaml(path=None):
                 "model_parameters": 39760,
                 "waterfall_threshold": 1.08,
                 "simulation_trials": 2000,
+                "measure_actual_gap": True,
+                "measured_gap_trials": 1,
+                "measurement_task": "mnist",
+                "test_samples": 1000,
                 "rounds": 130,
+                "gstar_rounds": 130,
+                "local_epochs": 1,
+                "batch_size": 600,
+                "learning_rate": 0.08,
                 "strong_convexity_mu": 0.1,
                 "lipschitz_l": 1.0,
                 "gradient_bound_zeta1": 1.0,
@@ -1837,6 +1845,8 @@ def figure_6(plot=False, seed=SEED, config=None):
     if isinstance(users_raw, list) and users_raw and isinstance(users_raw[0], list):
         users_raw = users_raw[0]
     users = [int(value) for value in users_raw]
+    if not users:
+        raise ValueError("figure_6.user_counts must not be empty")
     num_rbs = int(first_candidate(figure_cfg.get("num_rbs", 12)))
     samples_raw = figure_cfg.get("samples_per_user", wireless["ki_cycle"])
     if isinstance(samples_raw, list) and samples_raw and isinstance(samples_raw[0], list):
@@ -1847,7 +1857,17 @@ def figure_6(plot=False, seed=SEED, config=None):
     model_parameters = int(first_candidate(figure_cfg.get("model_parameters", 39760)))
     quantization_bits = int(first_candidate(figure_cfg.get("quantization_bits", train_cfg.get("quantization_bits", 16))))
     simulation_trials = int(first_candidate(figure_cfg.get("simulation_trials", 2000)))
+    measure_actual_gap = bool(first_candidate(figure_cfg.get("measure_actual_gap", True)))
+    measured_gap_trials = int(first_candidate(figure_cfg.get("measured_gap_trials", 1)))
+    measurement_task = str(first_candidate(figure_cfg.get("measurement_task", "mnist"))).lower()
+    test_samples = int(first_candidate(figure_cfg.get("test_samples", 1000)))
     rounds = int(first_candidate(figure_cfg.get("rounds", 130)))
+    gstar_rounds = int(first_candidate(figure_cfg.get("gstar_rounds", rounds)))
+    local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
+    batch_size = int(first_candidate(figure_cfg.get("batch_size", 600)))
+    activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
+    default_lr = train_cfg.get("mnist_lr", 0.08) if measurement_task == "mnist" else train_cfg.get("regression_lr", 0.08)
+    learning_rate = float(first_candidate(figure_cfg.get("learning_rate", default_lr)))
     mu = float(first_candidate(figure_cfg.get("strong_convexity_mu", 0.1)))
     lipschitz = float(first_candidate(figure_cfg.get("lipschitz_l", 1.0)))
     zeta1 = float(first_candidate(figure_cfg.get("gradient_bound_zeta1", 1.0)))
@@ -1855,6 +1875,12 @@ def figure_6(plot=False, seed=SEED, config=None):
     threshold = float(first_candidate(figure_cfg.get("waterfall_threshold", wireless["waterfall_threshold"])))
     if simulation_trials <= 0:
         raise ValueError("figure_6.simulation_trials must be positive")
+    if measured_gap_trials <= 0:
+        raise ValueError("figure_6.measured_gap_trials must be positive")
+    if measurement_task not in {"mnist", "regression"}:
+        raise ValueError("figure_6.measurement_task must be 'mnist' or 'regression'")
+    if rounds <= 0 or gstar_rounds <= 0:
+        raise ValueError("figure_6.rounds and figure_6.gstar_rounds must be positive")
     if mu <= 0.0 or lipschitz <= 0.0:
         raise ValueError("figure_6 strong_convexity_mu and lipschitz_l must be positive")
 
@@ -1910,10 +1936,118 @@ def figure_6(plot=False, seed=SEED, config=None):
             gaps = contractions * gaps + increments
         return float(np.mean(gaps))
 
+    def build_measurement_data(user_count, counts, data_seed):
+        cache_key = ("figure_6_measurement_data", measurement_task, user_count, tuple(counts), int(data_seed), test_samples, activation)
+        if cache_key in CACHED_DATA:
+            return CACHED_DATA[cache_key]
+        if measurement_task == "mnist":
+            data = load_mnist_data(num_users=user_count, samples_per_user=counts, test_samples=test_samples, seed=data_seed)
+            value = (data["users"], data["test"], MNISTFNN, "mnist")
+            CACHED_DATA[cache_key] = value
+            return value
+        data = generate_synthetic_data(num_users=user_count, samples_per_user=counts, seed=data_seed)
+        train_data = TensorDataset(data["x"], data["y"])
+
+        def model_factory():
+            return RegressionFNN(activation=activation)
+
+        value = (data["users"], train_data, model_factory, "regression")
+        CACHED_DATA[cache_key] = value
+        return value
+
+    def evaluate_model(model, eval_data, task, device_obj):
+        model.eval()
+        loss_fn = nn.CrossEntropyLoss()
+        eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
+        regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
+        loss_sum = 0.0
+        total = 0
+        correct = 0
+        target_min = float("inf")
+        target_max = float("-inf")
+        with torch.no_grad():
+            for features, labels in DataLoader(eval_data, batch_size=min(eval_batch_size, len(eval_data)), shuffle=False):
+                features = features.to(device_obj)
+                labels = labels.to(device_obj)
+                prediction = model(features)
+                if task == "mnist":
+                    loss = loss_fn(prediction, labels.long())
+                    loss_sum += float(loss.item()) * len(features)
+                    correct += int((prediction.argmax(dim=1) == labels).sum().item())
+                else:
+                    target = labels.float().reshape_as(prediction)
+                    loss_sum += float((prediction - target).pow(2).sum().item())
+                    target_min = min(target_min, float(target.min().item()))
+                    target_max = max(target_max, float(target.max().item()))
+                total += len(features)
+        if task == "regression" and str(train_cfg.get("regression_loss", "mse")).lower() == "nmse":
+            target_range = max(target_max - target_min, regression_scale_floor) if total else regression_scale_floor
+            return 4.0 * loss_sum / max(total, 1) / (target_range ** 2), float("nan")
+        return loss_sum / max(total, 1), correct / max(total, 1) if task == "mnist" else float("nan")
+
+    def run_fedavg_measurement(partitions, eval_data, model_factory, task, initial_state, selected_user_ids, selected_error_values, run_seed, run_rounds):
+        device_name = train_cfg.get("device", "auto")
+        if device_name == "auto":
+            device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        device_obj = torch.device(device_name)
+        global_model = model_factory().to(device_obj)
+        global_model.load_state_dict(copy.deepcopy(initial_state))
+        loss_fn = nn.CrossEntropyLoss()
+        packet_rng = np.random.default_rng(run_seed)
+        regression_loss = str(train_cfg.get("regression_loss", "mse")).lower()
+        if regression_loss not in {"mse", "nmse"}:
+            raise ValueError("training.regression_loss must be 'mse' or 'nmse'")
+        regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
+        selected_user_ids = np.asarray(selected_user_ids, dtype=np.int64)
+        selected_error_values = np.asarray(selected_error_values, dtype=np.float64)
+        for _round_index in range(run_rounds):
+            local_states = []
+            local_weights = []
+            for user_idx, packet_error in zip(selected_user_ids, selected_error_values):
+                if packet_rng.random() <= packet_error:
+                    continue
+                user_data = partitions[int(user_idx)]
+                local_model = copy.deepcopy(global_model).to(device_obj)
+                local_model.train()
+                optimizer = torch.optim.SGD(local_model.parameters(), lr=learning_rate)
+                loader = DataLoader(user_data, batch_size=min(batch_size, len(user_data)), shuffle=True)
+                for _local_epoch in range(local_epochs):
+                    for features, labels in loader:
+                        features = features.to(device_obj)
+                        labels = labels.to(device_obj)
+                        optimizer.zero_grad()
+                        prediction = local_model(features)
+                        if task == "mnist":
+                            loss = loss_fn(prediction, labels.long())
+                        else:
+                            target = labels.float().reshape_as(prediction)
+                            error = prediction - target
+                            if regression_loss == "nmse":
+                                target_range = (target.max() - target.min()).clamp_min(regression_scale_floor)
+                                loss = (2.0 * error / target_range).pow(2).mean()
+                            else:
+                                loss = error.pow(2).mean()
+                        loss.backward()
+                        optimizer.step()
+                local_states.append({name: value.detach().cpu() for name, value in local_model.state_dict().items()})
+                local_weights.append(float(len(user_data)))
+            if local_states:
+                total_weight = sum(local_weights)
+                averaged = {}
+                for name in local_states[0]:
+                    averaged[name] = sum(state[name] * (weight / total_weight) for state, weight in zip(local_states, local_weights))
+                global_model.load_state_dict(averaged)
+        return evaluate_model(global_model, eval_data, task, device_obj)
+
     theoretical_by_seed = []
     bound_simulated_by_seed = []
     selected_by_seed = []
     miss_ratio_by_seed = []
+    measured_gap_by_seed = []
+    wireless_loss_by_seed = []
+    gstar_loss_by_seed = []
+    wireless_accuracy_by_seed = []
+    gstar_accuracy_by_seed = []
     for average_seed in average_seeds:
         rng = np.random.default_rng(average_seed)
         distance_pool = np.maximum(rng.random(max(users)) * radius, np.finfo(np.float64).tiny)
@@ -1921,6 +2055,11 @@ def figure_6(plot=False, seed=SEED, config=None):
         bound_simulated_seed = []
         selected_seed = []
         miss_ratio_seed = []
+        measured_gap_seed = []
+        wireless_loss_seed = []
+        gstar_loss_seed = []
+        wireless_accuracy_seed = []
+        gstar_accuracy_seed = []
         for user_count in users:
             counts = np.asarray(samples_per_user[:user_count], dtype=np.float64)
             total = float(np.sum(counts))
@@ -1957,10 +2096,77 @@ def figure_6(plot=False, seed=SEED, config=None):
             miss_ratio_seed.append(miss_ratio)
             packet_rng = np.random.default_rng(average_seed * 1000003 + user_count * 7919 + 101)
             bound_simulated_seed.append(simulate_packet_error_bound(counts, selected_users_array, selected_errors, packet_rng))
+
+            if measure_actual_gap:
+                data_seed = average_seed * 1000003 + user_count * 7919 + 307
+                partitions, eval_data, model_factory, task = build_measurement_data(user_count, counts.astype(int).tolist(), data_seed)
+                torch.manual_seed(average_seed * 1000003 + user_count * 7919 + 409)
+                initial_model = model_factory()
+                initial_state = {name: value.detach().cpu().clone() for name, value in initial_model.state_dict().items()}
+                all_users = np.arange(user_count, dtype=np.int64)
+                no_errors = np.zeros(user_count, dtype=np.float64)
+                gstar_cache_key = (
+                    "figure_6_gstar",
+                    measurement_task,
+                    user_count,
+                    tuple(counts.astype(int).tolist()),
+                    int(data_seed),
+                    average_seed * 1000003 + user_count * 7919 + 409,
+                    gstar_rounds,
+                    local_epochs,
+                    batch_size,
+                    learning_rate,
+                    str(train_cfg.get("regression_loss", "mse")).lower(),
+                )
+                if gstar_cache_key in CACHED_DATA:
+                    gstar_loss, gstar_accuracy = CACHED_DATA[gstar_cache_key]
+                else:
+                    gstar_loss, gstar_accuracy = run_fedavg_measurement(
+                        partitions,
+                        eval_data,
+                        model_factory,
+                        task,
+                        initial_state,
+                        all_users,
+                        no_errors,
+                        average_seed * 1000003 + user_count * 7919 + 503,
+                        gstar_rounds,
+                    )
+                    CACHED_DATA[gstar_cache_key] = (gstar_loss, gstar_accuracy)
+                trial_losses = []
+                trial_accuracies = []
+                for trial_index in range(measured_gap_trials):
+                    wireless_loss, wireless_accuracy = run_fedavg_measurement(
+                        partitions,
+                        eval_data,
+                        model_factory,
+                        task,
+                        initial_state,
+                        selected_users_array,
+                        selected_errors,
+                        average_seed * 1000003 + user_count * 7919 + 601 + trial_index,
+                        rounds,
+                    )
+                    trial_losses.append(wireless_loss)
+                    trial_accuracies.append(wireless_accuracy)
+                wireless_loss = float(np.mean(trial_losses))
+                wireless_accuracy = float(np.nanmean(trial_accuracies)) if task == "mnist" else float("nan")
+                measured_gap_seed.append(wireless_loss - gstar_loss)
+                wireless_loss_seed.append(wireless_loss)
+                gstar_loss_seed.append(gstar_loss)
+                wireless_accuracy_seed.append(wireless_accuracy)
+                gstar_accuracy_seed.append(gstar_accuracy)
         theoretical_by_seed.append(theoretical_seed)
         bound_simulated_by_seed.append(bound_simulated_seed)
         selected_by_seed.append(selected_seed)
         miss_ratio_by_seed.append(miss_ratio_seed)
+        if measure_actual_gap:
+            measured_gap_by_seed.append(measured_gap_seed)
+            wireless_loss_by_seed.append(wireless_loss_seed)
+            gstar_loss_by_seed.append(gstar_loss_seed)
+            wireless_accuracy_by_seed.append(wireless_accuracy_seed)
+            gstar_accuracy_by_seed.append(gstar_accuracy_seed)
+
     theoretical = np.mean(theoretical_by_seed, axis=0).tolist()
     simulated = np.mean(bound_simulated_by_seed, axis=0).tolist()
     result = {
@@ -1978,7 +2184,15 @@ def figure_6(plot=False, seed=SEED, config=None):
             "model_megabits": model_megabits,
             "waterfall_threshold": threshold,
             "simulation_trials": simulation_trials,
+            "measure_actual_gap": measure_actual_gap,
+            "measured_gap_trials": measured_gap_trials,
+            "measurement_task": measurement_task,
+            "test_samples": test_samples,
             "rounds": rounds,
+            "gstar_rounds": gstar_rounds,
+            "local_epochs": local_epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
             "strong_convexity_mu": mu,
             "lipschitz_l": lipschitz,
             "gradient_bound_zeta1": zeta1,
@@ -1988,6 +2202,13 @@ def figure_6(plot=False, seed=SEED, config=None):
             "wireless_model": "docs/Wireless-FL/FLMIN.m",
         },
     }
+    if measure_actual_gap:
+        result["measured_convergence_gap"] = np.mean(measured_gap_by_seed, axis=0).tolist()
+        result["wireless_loss"] = np.mean(wireless_loss_by_seed, axis=0).tolist()
+        result["gstar_loss"] = np.mean(gstar_loss_by_seed, axis=0).tolist()
+        if measurement_task == "mnist":
+            result["wireless_accuracy"] = np.mean(wireless_accuracy_by_seed, axis=0).tolist()
+            result["gstar_accuracy"] = np.mean(gstar_accuracy_by_seed, axis=0).tolist()
     if plot:
         fig, ax = plt.subplots()
         ax.plot(users, theoretical, color="blue", marker="o", linewidth=2.5, label="Theoretical analysis")
@@ -1996,7 +2217,16 @@ def figure_6(plot=False, seed=SEED, config=None):
         ax.set_ylabel("Convergence gap due to wireless factors")
         ax.set_xticks(users)
         ax.set_yticks(np.arange(0, math.ceil(max(max(theoretical), max(simulated)) / 5) * 5 + 5, 5))
-        ax.legend()
+        if measure_actual_gap:
+            ax_measured = ax.twinx()
+            measured_gap = result["measured_convergence_gap"]
+            ax_measured.plot(users, measured_gap, color="red", marker="^", linestyle=":", linewidth=2.0, label="Measured FL gap")
+            ax_measured.set_ylabel("Measured loss gap")
+            handles, labels = ax.get_legend_handles_labels()
+            measured_handles, measured_labels = ax_measured.get_legend_handles_labels()
+            ax.legend(handles + measured_handles, labels + measured_labels)
+        else:
+            ax.legend()
         result["figure"] = fig
     return result
 
