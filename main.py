@@ -1457,6 +1457,16 @@ def load_yaml(path=None):
                 "batch_size": 32,
                 "learning_rate": 0.08,
             },
+            "figure_8": {
+                "user_counts": [3, 6, 9, 12, 15, 18],
+                "samples_per_user": [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100, 200, 300, 400],
+                "test_samples": 1000,
+                "rounds": 130,
+                "num_rbs": 12,
+                "local_epochs": 1,
+                "batch_size": 32,
+                "learning_rate": 0.08,
+            },
         },
     }
     if path is None:
@@ -1844,26 +1854,82 @@ def figure_7(plot=False, seed=SEED, rounds=130, config=None):
 
 
 def figure_8(plot=False, seed=SEED, config=None):
-    user_counts = [3, 6, 9, 12, 15, 18]
-    shared = load_mnist_data(num_users=max(user_counts), samples_per_user=180, test_samples=800, seed=seed)
-    test_data = shared["test"]
-    curves = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
-    for user_count in user_counts:
-        samples = ([180, 150, 120, 60, 30] * ((user_count + 4) // 5))[:user_count]
-        data = load_mnist_data(num_users=user_count, samples_per_user=samples, test_samples=800, seed=seed)
-        curves["proposed"].append(
-            proposed_algorithm(data["users"], MNISTFNN, task="mnist", test_data=test_data, rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
-        )
-        curves["baseline_a"].append(
-            baseline_a(data["users"], MNISTFNN, task="mnist", test_data=test_data, rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
-        )
-        curves["baseline_b"].append(
-            baseline_b(data["users"], MNISTFNN, task="mnist", test_data=test_data, rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
-        )
-        curves["baseline_c"].append(
-            baseline_c(data["users"], MNISTFNN, task="mnist", test_data=test_data, rounds=20, num_rbs=12, seed=seed, config=config)["metrics"]["accuracy"][-1]
-        )
-    result = {"users": user_counts, "accuracy": curves}
+    cfg = load_yaml() if config is None else config
+    figure_cfg = cfg.get("figures", {}).get("figure_8", {})
+
+    def first_candidate(value):
+        if isinstance(value, list):
+            if not value:
+                raise ValueError("Figure configuration candidate lists must not be empty")
+            return value[0]
+        return value
+
+    user_counts_raw = figure_cfg.get("user_counts", [3, 6, 9, 12, 15, 18])
+    if isinstance(user_counts_raw, list) and user_counts_raw and isinstance(user_counts_raw[0], list):
+        user_counts_raw = user_counts_raw[0]
+    user_counts = [int(value) for value in user_counts_raw]
+    samples_raw = figure_cfg.get("samples_per_user", [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100, 200, 300, 400])
+    if isinstance(samples_raw, list) and samples_raw and isinstance(samples_raw[0], list):
+        samples_raw = samples_raw[0]
+    sample_pool = [int(value) for value in samples_raw]
+    if max(user_counts) > len(sample_pool):
+        raise ValueError("figure_8.samples_per_user must cover the largest figure_8.user_counts value")
+    test_samples = int(first_candidate(figure_cfg.get("test_samples", 1000)))
+    rounds = int(first_candidate(figure_cfg.get("rounds", 130)))
+    num_rbs = int(first_candidate(figure_cfg.get("num_rbs", 12)))
+    local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
+    batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
+    learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["mnist_lr"])))
+    average_seeds_raw = figure_cfg.get("average_seeds", [seed])
+    if isinstance(average_seeds_raw, list) and average_seeds_raw and isinstance(average_seeds_raw[0], list):
+        average_seeds_raw = average_seeds_raw[0]
+    average_seeds = [int(value) for value in average_seeds_raw]
+    if not average_seeds:
+        raise ValueError("figure_8.average_seeds must not be empty")
+
+    curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
+    runners = {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b, "baseline_c": baseline_c}
+    for average_seed in average_seeds:
+        shared = load_mnist_data(num_users=max(user_counts), samples_per_user=sample_pool[:max(user_counts)], test_samples=test_samples, seed=average_seed)
+        test_data = shared["test"]
+        seed_curves = {name: [] for name in curves_by_seed}
+        for user_count in user_counts:
+            samples = sample_pool[:user_count]
+            data = load_mnist_data(num_users=user_count, samples_per_user=samples, test_samples=test_samples, seed=average_seed)
+            for name, runner in runners.items():
+                output = runner(
+                    data["users"],
+                    MNISTFNN,
+                    task="mnist",
+                    test_data=test_data,
+                    rounds=rounds,
+                    num_rbs=num_rbs,
+                    local_epochs=local_epochs,
+                    batch_size=batch_size,
+                    learning_rate=learning_rate,
+                    seed=average_seed,
+                    config=cfg,
+                )
+                seed_curves[name].append(output["metrics"]["accuracy"][-1])
+        for name, values in seed_curves.items():
+            curves_by_seed[name].append(values)
+    curves = {name: np.mean(values, axis=0).tolist() for name, values in curves_by_seed.items()}
+    result = {
+        "users": user_counts,
+        "accuracy": curves,
+        "hyperparameters": {
+            "user_counts": user_counts,
+            "samples_per_user": sample_pool,
+            "test_samples": test_samples,
+            "rounds": rounds,
+            "num_rbs": num_rbs,
+            "local_epochs": local_epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "average_seeds": average_seeds,
+            "average_runs": len(average_seeds),
+        },
+    }
     if plot:
         fig, ax = plt.subplots()
         ax.plot(user_counts, curves["proposed"], color="black", linewidth=2.0, label="Proposed FL")
@@ -1873,9 +1939,12 @@ def figure_8(plot=False, seed=SEED, config=None):
         ax.set_xlabel("Total number of users")
         ax.set_ylabel("Identification accuracy")
         ax.set_xlim(min(user_counts), max(user_counts))
-        ax.set_ylim(0.65, 0.92)
+        accuracy_values = [value for values in curves.values() for value in values]
+        y_min = math.floor(min(accuracy_values) / 0.02) * 0.02
+        y_max = math.ceil(max(accuracy_values) / 0.02) * 0.02
+        ax.set_ylim(y_min, y_max)
         ax.set_xticks(user_counts)
-        ax.set_yticks(np.arange(0.66, 0.921, 0.02))
+        ax.set_yticks(np.arange(y_min, y_max + 0.01, 0.02))
         ax.legend()
         result["figure"] = fig
     return result
@@ -1998,6 +2067,8 @@ def main():
         if key.endswith("sample_counts") and (not value or not isinstance(value[0], list)):
             return [value]
         if key.endswith("samples_per_user") and (not value or not isinstance(value[0], list)):
+            return [value]
+        if key.endswith("user_counts") and (not value or not isinstance(value[0], list)):
             return [value]
         if key.endswith("average_seeds") and (not value or not isinstance(value[0], list)):
             return [value]

@@ -65,3 +65,17 @@ figures:
     learning_rate: [0.08]
     # FLMIN.m averages three independent FL implementations.
     average_seeds: [0, 42, 1004]
+  figure_8:
+    user_counts:
+      - [3, 6, 9, 12, 15, 18]
+    # FLMIN.m datanumber prefix values; Fig. 8 varies the total number of users.
+    samples_per_user:
+      - [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100, 200, 300, 400]
+    test_samples: [1000]
+    rounds: [130]
+    num_rbs: [12]
+    local_epochs: [1]
+    batch_size: [32]
+    learning_rate: [0.08]
+    # FLMIN.m averages three independent FL implementations.
+    average_seeds: [0, 42, 1004]
