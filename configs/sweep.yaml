@@ -53,3 +53,15 @@ figures:
     batch_size: [50]
     activation: [identity]
     learning_rate: [0.01]
+  figure_7:
+    # FLMIN.m datanumber values for the 15-user MNIST FNN experiment.
+    samples_per_user:
+      - [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100]
+    test_samples: [1000]
+    rounds: [130]
+    num_rbs: [12]
+    local_epochs: [1]
+    batch_size: [32]
+    learning_rate: [0.08]
+    # FLMIN.m averages three independent FL implementations.
+    average_seeds: [0, 42, 1004]
