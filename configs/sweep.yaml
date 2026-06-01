@@ -70,6 +70,7 @@ figures:
     # FLMIN.m uses Z = 39760 * 16 bits.
     model_parameters: [39760]
     waterfall_threshold: [1.08]
+    simulation_trials: [2000]
     rounds: [130]
     local_epochs: [1]
     activation: [tanh]
