@@ -1,0 +1,8 @@
+figure: 6
+context_count: 60
+started_at: 2026-06-03 20:14:16
+figure_6: started
+figure_6: {'context_count': 60, 'users': [3, 6, 9, 12, 15, 18], 'theoretical_gap': [3.9386861788610092, 10.729536898355601, 24.020084440020472, 28.852163835396205, 42.271101142802635, 73.02415271897384], 'simulation_gap': [3.9139215147132242, 10.593230892803103, 22.605597816894107, 27.815291798288087, 39.839852625001015, 63.82198404103252], 'selected_users': [3.0, 5.9, 8.0, 10.5, 11.4, 11.7], 'miss_ratio': [0.04049040883607349, 0.09760798973474538, 0.15970203502954833, 0.193971715471222, 0.24468422056005915, 0.3141849578003734], 'hyperparameters': {'user_counts': [3, 6, 9, 12, 15, 18], 'num_rbs': 12, 'samples_per_user': [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100, 200, 300, 400], 'model_parameters': 39760, 'quantization_bits': 16, 'model_megabits': 0.606689453125, 'waterfall_threshold': 1.08, 'simulation_trials': 2000, 'rounds': 60, 'strong_convexity_mu': 0.1, 'lipschitz_l': 1.0, 'gradient_bound_zeta1': 4.225, 'gradient_bound_zeta2': 0.48, 'seeds': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 'seed_runs': 10, 'wireless_model': 'docs/Wireless-FL/FLMIN.m'}, 'plot_path': 'outputs/gpu_run_20260603_2003/figure_6/001_contexts_60.png', 'figure_log_path': 'outputs/gpu_run_20260603_2003/figure_6/run.log'}
+saved: outputs/gpu_run_20260603_2003/figure_6/001_contexts_60.png
+saved_json: outputs/gpu_run_20260603_2003/figure_6/001_contexts_60.json
+saved_log: outputs/gpu_run_20260603_2003/figure_6/run.log

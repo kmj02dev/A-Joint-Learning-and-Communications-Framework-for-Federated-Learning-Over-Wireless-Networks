@@ -1,8 +1,11 @@
 import argparse
 import copy
+import json
 import math
 import os
+import sys
 import time
+import traceback
 from pathlib import Path
 
 import matplotlib
@@ -12,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import yaml
-from scipy.optimize import brentq, linear_sum_assignment
+from scipy.optimize import brentq, linear_sum_assignment, linprog
 from torch import nn
 from torch.utils.data import DataLoader, Subset, TensorDataset
 
@@ -329,6 +332,19 @@ class MNISTCNN(nn.Module):
         return self.classifier(self.features(x))
 
 
+def _training_compute_dtype(quantization_bits, device_name="cpu"):
+    """Use communication quantization bits for model size, but keep CPU math practical."""
+    quantization_bits = int(quantization_bits)
+    device_text = str(device_name).lower()
+    if quantization_bits == 16:
+        return torch.float16 if device_text.startswith("cuda") else torch.float32
+    if quantization_bits == 32:
+        return torch.float32
+    if quantization_bits == 64:
+        return torch.float64
+    raise ValueError("training.quantization_bits supports actual compute dtype only for 16, 32, or 64 bits")
+
+
 # FL algorithms
 def fl_one_round(
     context,
@@ -341,6 +357,7 @@ def fl_one_round(
     aggregation="fedavg",
     verbose=False,
     scheme=None,
+    continuous_weights=None,
 ):
     """Run one wireless-impaired local-training/FedAvg round for selected clients."""
     train_cfg = context.loss["training"]
@@ -349,14 +366,7 @@ def fl_one_round(
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
     device_obj = torch.device(device_name)
     quantization_bits = int(train_cfg["quantization_bits"])
-    if quantization_bits == 16:
-        compute_dtype = torch.float16
-    elif quantization_bits == 32:
-        compute_dtype = torch.float32
-    elif quantization_bits == 64:
-        compute_dtype = torch.float64
-    else:
-        raise ValueError("training.quantization_bits supports actual compute dtype only for 16, 32, or 64 bits")
+    compute_dtype = _training_compute_dtype(quantization_bits, device_obj.type)
     global_model = global_model.to(device_obj, dtype=compute_dtype)
     loss_fn = nn.CrossEntropyLoss()
     regression_loss = str(train_cfg["regression_loss"]).lower()
@@ -427,6 +437,12 @@ def fl_one_round(
     selected_users_array = np.asarray(selected_users, dtype=np.int64)
     assigned_rbs_array = np.asarray(assigned_rbs, dtype=np.int64)
     selected_errors_array = np.asarray(selected_errors, dtype=np.float64)
+    continuous_weights_array = None
+    if continuous_weights is not None:
+        continuous_weights_array = np.asarray(continuous_weights, dtype=np.float64)
+        if continuous_weights_array.shape != selected_users_array.shape:
+            raise ValueError("continuous_weights must have the same shape as selected_users")
+        continuous_weights_array = np.maximum(continuous_weights_array, 0.0)
     powers_matrix = np.asarray(context.powers) if context.powers is not None else None
     rates_matrix = np.asarray(context.uplink_rates) if context.uplink_rates is not None else None
     delays_matrix = np.asarray(context.total_delays) if context.total_delays is not None else None
@@ -448,7 +464,10 @@ def fl_one_round(
 
     if verbose:
         scheme_label = scheme or "fl"
-        expected_successes = float(np.sum(1.0 - selected_errors_array)) if selected_errors_array.size else 0.0
+        if continuous_weights_array is None:
+            expected_successes = float(np.sum(1.0 - selected_errors_array)) if selected_errors_array.size else 0.0
+        else:
+            expected_successes = float(np.sum(continuous_weights_array))
         verbose_print(
             f"[fl_one_round][{scheme_label}] round={round_index + 1} task={context.task} "
             f"device={device_obj} dtype={compute_dtype} optimizer={optimizer_name} lr={learning_rate:.6g} local_epochs={local_epochs} "
@@ -480,7 +499,7 @@ def fl_one_round(
     if verbose:
         global_state_before = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
 
-    for user_idx, rb_idx, packet_error in zip(selected_users_array, assigned_rbs_array, selected_errors_array):
+    for local_pos, (user_idx, rb_idx, packet_error) in enumerate(zip(selected_users_array, assigned_rbs_array, selected_errors_array)):
         local_model = copy.deepcopy(global_model).to(device_obj, dtype=compute_dtype)
         local_model.train()
         if optimizer_name == "adam":
@@ -603,25 +622,36 @@ def fl_one_round(
                         cpu_state["state"][state_key][item_key] = copy.deepcopy(item_value)
             context.optimizer_states[int(user_idx)] = cpu_state
 
-        forced_success = force_first_round_success and round_index == 0 and packet_error < 1.0
-        packet_draw = None if forced_success else float(rng.random())
-        packet_success = forced_success or packet_draw > packet_error
-        if verbose:
-            reason = "forced_first_round_success" if forced_success else "crc_success" if packet_success else "crc_drop"
-            draw_text = "n/a" if packet_draw is None else f"{packet_draw:.9g}"
-            verbose_print(
-                f"[fl_one_round][{scheme_label}] user={int(user_idx)} packet_draw={draw_text} "
-                f"packet_error={float(packet_error):.9g} accepted={packet_success} reason={reason}"
-            )
+        if continuous_weights_array is None:
+            forced_success = force_first_round_success and round_index == 0 and packet_error < 1.0
+            packet_draw = None if forced_success else float(rng.random())
+            packet_success = forced_success or packet_draw > packet_error
+            success_weight = 1.0 if packet_success else 0.0
+            if verbose:
+                reason = "forced_first_round_success" if forced_success else "crc_success" if packet_success else "crc_drop"
+                draw_text = "n/a" if packet_draw is None else f"{packet_draw:.9g}"
+                verbose_print(
+                    f"[fl_one_round][{scheme_label}] user={int(user_idx)} packet_draw={draw_text} "
+                    f"packet_error={float(packet_error):.9g} accepted={packet_success} reason={reason}"
+                )
+        else:
+            success_weight = float(continuous_weights_array[local_pos])
+            packet_success = success_weight > 0.0
+            if verbose:
+                verbose_print(
+                    f"[fl_one_round][{scheme_label}] user={int(user_idx)} "
+                    f"expected_success_weight={success_weight:.9g} accepted={packet_success} "
+                    f"reason=continuous_expectation"
+                )
         if packet_success:
             local_states.append({name: value.detach().cpu() for name, value in local_model.state_dict().items()})
             if aggregation == "fedavg":
-                local_weights.append(float(len(context.partitions[int(user_idx)])))
+                local_weights.append(float(len(context.partitions[int(user_idx)])) * success_weight)
             elif aggregation == "uniform":
-                local_weights.append(1.0)
+                local_weights.append(success_weight)
             else:
                 raise ValueError(f"Unsupported aggregation: {aggregation}")
-            successes += 1
+            successes += success_weight
 
     if local_states:
         total_weight = sum(local_weights)
@@ -1671,6 +1701,139 @@ def baseline_c(
     }
 
 
+def _solve_continuous_lp_allocation(weights, feasible):
+    """Solve the continuous assignment relaxation with HiGHS."""
+    num_users, num_rbs = weights.shape
+    eligible = np.asarray(feasible, dtype=bool) & (np.asarray(weights) < 0.0)
+    if not np.any(eligible):
+        return np.zeros_like(weights, dtype=np.float64), 0
+
+    variable_count = num_users * num_rbs
+    objective = np.where(eligible, weights, 0.0).reshape(-1)
+    a_ub = np.zeros((num_users + num_rbs, variable_count), dtype=np.float64)
+    for user_idx in range(num_users):
+        a_ub[user_idx, user_idx * num_rbs : (user_idx + 1) * num_rbs] = 1.0
+    for rb_idx in range(num_rbs):
+        a_ub[num_users + rb_idx, rb_idx::num_rbs] = 1.0
+    bounds = [(0.0, 1.0) if eligible.flat[index] else (0.0, 0.0) for index in range(variable_count)]
+    result = linprog(
+        objective,
+        A_ub=a_ub,
+        b_ub=np.ones(num_users + num_rbs, dtype=np.float64),
+        bounds=bounds,
+        method="highs",
+    )
+    if not result.success:
+        raise RuntimeError(f"Continuous-LP(HiGHS) failed: {result.message}")
+    allocation = np.clip(result.x.reshape(num_users, num_rbs), 0.0, 1.0)
+    allocation[~eligible] = 0.0
+    allocation[allocation < 1e-10] = 0.0
+    return allocation, int(getattr(result, "nit", variable_count))
+
+
+def _solve_soft_entropy_kkt_allocation(weights, feasible, tau=1.0, max_iter=1000, tol=1e-9):
+    """Solve an entropy-regularized soft assignment by Sinkhorn KKT scaling."""
+    if tau <= 0.0:
+        raise ValueError("tau must be positive for Soft-Entropy-KKT")
+    num_users, num_rbs = weights.shape
+    eligible = np.asarray(feasible, dtype=bool) & (np.asarray(weights) < 0.0)
+    if not np.any(eligible):
+        return np.zeros_like(weights, dtype=np.float64), 0
+
+    size = num_users + num_rbs
+    kernel = np.ones((size, size), dtype=np.float64)
+    kernel[:num_users, :num_rbs] = 0.0
+    logits = np.clip(-np.asarray(weights, dtype=np.float64) / float(tau), -700.0, 700.0)
+    kernel[:num_users, :num_rbs][eligible] = np.exp(logits[eligible])
+    scaling = kernel.copy()
+    iterations = 0
+    for iterations in range(1, int(max_iter) + 1):
+        row_sums = np.maximum(scaling.sum(axis=1, keepdims=True), 1e-300)
+        scaling /= row_sums
+        col_sums = np.maximum(scaling.sum(axis=0, keepdims=True), 1e-300)
+        scaling /= col_sums
+        if iterations % 10 == 0 or iterations == 1:
+            row_error = float(np.max(np.abs(scaling.sum(axis=1) - 1.0)))
+            col_error = float(np.max(np.abs(scaling.sum(axis=0) - 1.0)))
+            if max(row_error, col_error) <= tol:
+                break
+
+    allocation = np.clip(scaling[:num_users, :num_rbs], 0.0, 1.0)
+    allocation[~eligible] = 0.0
+    allocation[allocation < 1e-10] = 0.0
+    return allocation, iterations
+
+
+def _continuous_assignment_view(allocation, packet_errors, powers):
+    """Convert a soft U x R assignment into per-user expected-success metadata."""
+    row_mass = np.asarray(allocation, dtype=np.float64).sum(axis=1)
+    success_mass = (np.asarray(allocation, dtype=np.float64) * (1.0 - np.asarray(packet_errors, dtype=np.float64))).sum(axis=1)
+    selected_users = np.flatnonzero(success_mass > 1e-12).astype(np.int64)
+    assigned_rbs = []
+    selected_errors = []
+    selected_powers = []
+    continuous_weights = []
+    for user_idx in selected_users:
+        user_allocation = allocation[int(user_idx)]
+        mass = float(row_mass[int(user_idx)])
+        rb_idx = int(np.argmax(user_allocation)) if mass > 0.0 else 0
+        assigned_rbs.append(rb_idx)
+        if mass > 0.0:
+            selected_errors.append(float(np.sum(user_allocation * packet_errors[int(user_idx)]) / mass))
+            selected_powers.append(float(np.sum(user_allocation * powers[int(user_idx)]) / mass))
+        else:
+            selected_errors.append(1.0)
+            selected_powers.append(0.0)
+        continuous_weights.append(float(success_mass[int(user_idx)]))
+    return (
+        selected_users,
+        np.asarray(assigned_rbs, dtype=np.int64),
+        np.asarray(selected_errors, dtype=np.float64),
+        np.asarray(selected_powers, dtype=np.float64),
+        np.asarray(continuous_weights, dtype=np.float64),
+    )
+
+
+def _summarize_method_wall_times(timing_records, axis_label=None):
+    """Summarize per-method wall-clock seconds recorded inside figure runners."""
+    summary = {}
+    for method_name, records in timing_records.items():
+        seconds = np.asarray([float(record["seconds"]) for record in records], dtype=np.float64)
+        if not seconds.size:
+            summary[method_name] = {
+                "runs": 0,
+                "total_seconds": 0.0,
+                "mean_seconds_per_run": 0.0,
+                "min_seconds_per_run": 0.0,
+                "max_seconds_per_run": 0.0,
+            }
+            continue
+        method_summary = {
+            "runs": int(seconds.size),
+            "total_seconds": float(seconds.sum()),
+            "mean_seconds_per_run": float(seconds.mean()),
+            "min_seconds_per_run": float(seconds.min()),
+            "max_seconds_per_run": float(seconds.max()),
+        }
+        if axis_label is not None:
+            by_axis = {}
+            axis_values = sorted({record["axis_value"] for record in records})
+            for axis_value in axis_values:
+                axis_seconds = np.asarray(
+                    [float(record["seconds"]) for record in records if record["axis_value"] == axis_value],
+                    dtype=np.float64,
+                )
+                by_axis[str(axis_value)] = {
+                    "runs": int(axis_seconds.size),
+                    "mean_seconds": float(axis_seconds.mean()),
+                    "total_seconds": float(axis_seconds.sum()),
+                }
+            method_summary["axis_label"] = axis_label
+            method_summary["by_axis"] = by_axis
+        summary[method_name] = method_summary
+    return summary
+
+
 def proposed_algorithm(
     partitions=None,
     model=None,
@@ -1859,7 +2022,11 @@ def proposed_algorithm(
             energies[user_idx, rb_idx] = energy
             feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
 
-    resource_search = str(resource_search)
+    resource_search = str(resource_search).lower().replace("-", "_")
+    if resource_search in {"lp", "lp_highs", "continuous_lp_highs"}:
+        resource_search = "continuous_lp"
+    if resource_search in {"soft_entropy_kkt", "soft_entropy_kkt_tau_1", "entropy_kkt_tau1"}:
+        resource_search = "soft_entropy_kkt_tau1"
     # Equation (24): feasible edges get Ki(q-1), infeasible edges are neutral.
     weights = np.where(feasible, counts[:, None] * (packet_errors - 1.0), 0.0)
     allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
@@ -2051,15 +2218,36 @@ def proposed_algorithm(
                 selected_users.append(int(user_idx))
                 assigned_rbs.append(int(rb_idx))
                 used_mask |= 1 << rb_idx
+    elif resource_search == "continuous_lp":
+        allocation, solver_iterations = _solve_continuous_lp_allocation(weights, feasible)
+        solver_iteration_components = {"highs_iterations": solver_iterations}
+        selected_users, assigned_rbs, selected_errors, selected_powers, continuous_weights = _continuous_assignment_view(
+            allocation, packet_errors, powers
+        )
+    elif resource_search == "soft_entropy_kkt_tau1":
+        allocation, solver_iterations = _solve_soft_entropy_kkt_allocation(weights, feasible, tau=1.0)
+        solver_iteration_components = {"sinkhorn_iterations": solver_iterations}
+        selected_users, assigned_rbs, selected_errors, selected_powers, continuous_weights = _continuous_assignment_view(
+            allocation, packet_errors, powers
+        )
     else:
         raise ValueError(f"Unsupported resource search method: {resource_search}")
 
     selected_users = np.array(selected_users, dtype=np.int64)
     assigned_rbs = np.array(assigned_rbs, dtype=np.int64)
-    selected_errors = np.array(
-        [packet_errors[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64
-    )
-    selected_powers = np.array([powers[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64)
+    if continuous_weights is None:
+        selected_errors = np.array(
+            [packet_errors[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64
+        )
+        selected_powers = np.array([powers[user_idx, rb_idx] for user_idx, rb_idx in zip(selected_users, assigned_rbs)], dtype=np.float64)
+    else:
+        continuous_weights = np.asarray(continuous_weights, dtype=np.float64)
+    scheme_label = {
+        "hungarian": "proposed",
+        "heuristic": "optimal_fl",
+        "continuous_lp": "continuous_lp_highs",
+        "soft_entropy_kkt_tau1": "soft_entropy_kkt_tau1",
+    }[resource_search]
 
     metrics = {"loss": [], "accuracy": [], "successful_users": []}
     trained_state = None
@@ -2113,7 +2301,8 @@ def proposed_algorithm(
                 round_index=round_index,
                 aggregation="fedavg",
                 verbose=verbose,
-                scheme="proposed" if resource_search == "hungarian" else "optimal_fl",
+                scheme=scheme_label,
+                continuous_weights=continuous_weights,
             )
 
             global_model.eval()
@@ -2158,7 +2347,7 @@ def proposed_algorithm(
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
 
     return {
-        "scheme": "proposed" if resource_search == "hungarian" else "optimal_fl",
+        "scheme": scheme_label,
         "resource_search": resource_search,
         "allocation": allocation,
         "selected_users": selected_users,
@@ -2173,6 +2362,7 @@ def proposed_algorithm(
         "energies": energies,
         "model_bits": model_bits,
         "counts": counts,
+        "continuous_success_weights": continuous_weights,
         "solver_iterations": solver_iterations,
         "solver_iteration_components": solver_iteration_components,
         "metrics": metrics,
@@ -2475,14 +2665,7 @@ def figure_3(contexts):
     learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
     regression_loss = str(first_candidate(cfg["training"]["regression_loss"])).lower()
     quantization_bits = int(first_candidate(cfg["training"]["quantization_bits"]))
-    if quantization_bits == 16:
-        compute_dtype = torch.float16
-    elif quantization_bits == 32:
-        compute_dtype = torch.float32
-    elif quantization_bits == 64:
-        compute_dtype = torch.float64
-    else:
-        raise ValueError("training.quantization_bits supports actual compute dtype only for 16, 32, or 64 bits")
+    compute_dtype = _training_compute_dtype(quantization_bits, "cpu")
     if regression_loss not in {"mse", "nmse"}:
         raise ValueError("regression_loss must be 'mse' or 'nmse'")
     run_config = copy.deepcopy(cfg)
@@ -2619,23 +2802,23 @@ def figure_4(contexts):
     eval_batch_size = int(first_candidate(cfg["training"]["eval_batch_size"]))
     regression_loss = str(first_candidate(cfg["training"]["regression_loss"])).lower()
     quantization_bits = int(first_candidate(cfg["training"]["quantization_bits"]))
-    if quantization_bits == 16:
-        compute_dtype = torch.float16
-    elif quantization_bits == 32:
-        compute_dtype = torch.float32
-    elif quantization_bits == 64:
-        compute_dtype = torch.float64
-    else:
-        raise ValueError("training.quantization_bits supports actual compute dtype only for 16, 32, or 64 bits")
+    compute_dtype = _training_compute_dtype(quantization_bits, "cpu")
     if regression_loss not in {"mse", "nmse"}:
         raise ValueError("regression_loss must be 'mse' or 'nmse'")
     run_config = copy.deepcopy(cfg)
     run_config["training"]["regression_loss"] = regression_loss
     run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
-    curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": []}
+    curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "continuous_lp": [], "soft_entropy_kkt": []}
+    timing_records = {name: [] for name in curves_by_seed}
     data_seeds_by_seed = {}
-    runners = {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}
+    runners = {
+        "proposed": proposed_algorithm,
+        "baseline_a": baseline_a,
+        "baseline_b": baseline_b,
+        "continuous_lp": lambda *args, **kwargs: proposed_algorithm(*args, resource_search="continuous_lp", **kwargs),
+        "soft_entropy_kkt": lambda *args, **kwargs: proposed_algorithm(*args, resource_search="soft_entropy_kkt_tau1", **kwargs),
+    }
     for run_seed in run_seeds:
         # Independent data seeds avoid reusing easier/harder samples across x-values.
         data_seed_rng = np.random.default_rng(run_seed)
@@ -2651,6 +2834,7 @@ def figure_4(contexts):
             for curve_name, runner in runners.items():
                 model_instance = RegressionFNN(activation=activation)
                 model_instance.load_state_dict(copy.deepcopy(initial_state))
+                started = time.perf_counter()
                 output = runner(
                     data["users"],
                     model_instance,
@@ -2663,6 +2847,8 @@ def figure_4(contexts):
                     seed=run_seed,
                     config=run_config,
                 )
+                elapsed = time.perf_counter() - started
+                timing_records[curve_name].append({"axis_value": int(count), "seconds": elapsed})
                 fitted = RegressionFNN(activation=activation).to(dtype=compute_dtype)
                 fitted.load_state_dict(output["model_state"])
                 fitted.eval()
@@ -2681,6 +2867,7 @@ def figure_4(contexts):
     result = {
         "samples_per_user": sample_counts,
         "loss": curves,
+        "method_wall_time_seconds": _summarize_method_wall_times(timing_records, axis_label="samples_per_user"),
         "hyperparameters": {
             "sample_counts": sample_counts,
             "rounds": rounds,
@@ -2699,6 +2886,7 @@ def figure_4(contexts):
             "data_seeds_by_seed": data_seeds_by_seed,
             "seeds": run_seeds,
             "seed_runs": len(run_seeds),
+            "continuous_soft_baselines": ["Continuous-LP(HiGHS)", "Soft-Entropy-KKT(tau=1)"],
         },
     }
     if plot:
@@ -2706,6 +2894,8 @@ def figure_4(contexts):
         ax.plot(sample_counts, curves["proposed"], color="blue", marker="o", linewidth=2.5, label="Proposed algorithm")
         ax.plot(sample_counts, curves["baseline_a"], color="red", linestyle=(0, (6, 4)), linewidth=2.5, label="Baseline a)")
         ax.plot(sample_counts, curves["baseline_b"], color="black", marker="s", linestyle=(0, (6, 4)), linewidth=2.5, label="Baseline b)")
+        ax.plot(sample_counts, curves["continuous_lp"], color="green", marker="^", linestyle="-.", linewidth=2.0, label="Continuous-LP(HiGHS)")
+        ax.plot(sample_counts, curves["soft_entropy_kkt"], color="purple", marker="d", linestyle=(0, (2, 2)), linewidth=2.0, label="Soft-Entropy-KKT(tau=1)")
         ax.set_xlabel("Number of data samples per user")
         ax.set_ylabel("Value of the loss function")
         ax.set_xticks(sample_counts)
@@ -3012,21 +3202,25 @@ def figure_7(contexts):
     local_epochs = int(first_candidate(figure_cfg["local_epochs"]))
     learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
     quantization_bits = int(first_candidate(cfg["training"]["quantization_bits"]))
-    if quantization_bits == 16:
-        compute_dtype = torch.float16
-    elif quantization_bits == 32:
-        compute_dtype = torch.float32
-    elif quantization_bits == 64:
-        compute_dtype = torch.float64
-    else:
-        raise ValueError("training.quantization_bits supports actual compute dtype only for 16, 32, or 64 bits")
+    device_name = cfg["training"]["device"]
+    if device_name == "auto":
+        device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_dtype = _training_compute_dtype(quantization_bits, device_name)
     optimizer_name = str(cfg["training"].get("optimizer", "gradient_descent")).lower().replace("-", "_")
     if optimizer_name in {"gd", "full_batch_gradient_descent"}:
         optimizer_name = "gradient_descent"
     run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
-    curves = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
-    runners = {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b, "baseline_c": baseline_c}
+    curves = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": [], "continuous_lp": [], "soft_entropy_kkt": []}
+    timing_records = {name: [] for name in curves}
+    runners = {
+        "proposed": proposed_algorithm,
+        "baseline_a": baseline_a,
+        "baseline_b": baseline_b,
+        "baseline_c": baseline_c,
+        "continuous_lp": lambda *args, **kwargs: proposed_algorithm(*args, resource_search="continuous_lp", **kwargs),
+        "soft_entropy_kkt": lambda *args, **kwargs: proposed_algorithm(*args, resource_search="soft_entropy_kkt_tau1", **kwargs),
+    }
     for run_seed in run_seeds:
         data = load_mnist_data(
             num_users=num_users,
@@ -3037,6 +3231,7 @@ def figure_7(contexts):
             partition_order=cfg["training"]["mnist_partition_order"],
         )
         for name, runner in runners.items():
+            started = time.perf_counter()
             output = runner(
                 data["users"],
                 MNISTFNN,
@@ -3049,6 +3244,8 @@ def figure_7(contexts):
                 seed=run_seed,
                 config=cfg,
             )
+            elapsed = time.perf_counter() - started
+            timing_records[name].append({"axis_value": int(run_seed), "seconds": elapsed})
             curves[name].append(output["metrics"]["accuracy"])
     curves = {name: np.mean(values, axis=0).tolist() for name, values in curves.items()}
     hyperparameters = {
@@ -3064,6 +3261,7 @@ def figure_7(contexts):
         "seeds": run_seeds,
         "seed_runs": len(run_seeds),
         "baseline_c_mode": cfg["training"]["baseline_c_mode"],
+        "continuous_soft_baselines": ["Continuous-LP(HiGHS)", "Soft-Entropy-KKT(tau=1)"],
     }
     if optimizer_name == "adam":
         hyperparameters.update(
@@ -3089,6 +3287,7 @@ def figure_7(contexts):
     result = {
         "rounds": list(range(1, rounds + 1)),
         "accuracy": curves,
+        "method_wall_time_seconds": _summarize_method_wall_times(timing_records, axis_label="seed"),
         "hyperparameters": hyperparameters,
     }
     if plot:
@@ -3097,6 +3296,8 @@ def figure_7(contexts):
         ax.plot(result["rounds"], curves["baseline_a"], color="blue", linestyle=(0, (6, 4)), linewidth=2.0, label="Baseline a)")
         ax.plot(result["rounds"], curves["baseline_b"], color="red", linewidth=2.0, label="Baseline b)")
         ax.plot(result["rounds"], curves["baseline_c"], color="red", linestyle=":", linewidth=2.0, label="Baseline c)")
+        ax.plot(result["rounds"], curves["continuous_lp"], color="green", linestyle="-.", linewidth=2.0, label="Continuous-LP(HiGHS)")
+        ax.plot(result["rounds"], curves["soft_entropy_kkt"], color="purple", linestyle=(0, (2, 2)), linewidth=2.0, label="Soft-Entropy-KKT(tau=1)")
         ax.set_xlabel("Number of iterations")
         ax.set_ylabel("Identification accuracy")
         ax.set_xlim(0, rounds)
@@ -3148,8 +3349,16 @@ def figure_8(contexts):
     learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
     run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
-    curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
-    runners = {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b, "baseline_c": baseline_c}
+    curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": [], "continuous_lp": [], "soft_entropy_kkt": []}
+    timing_records = {name: [] for name in curves_by_seed}
+    runners = {
+        "proposed": proposed_algorithm,
+        "baseline_a": baseline_a,
+        "baseline_b": baseline_b,
+        "baseline_c": baseline_c,
+        "continuous_lp": lambda *args, **kwargs: proposed_algorithm(*args, resource_search="continuous_lp", **kwargs),
+        "soft_entropy_kkt": lambda *args, **kwargs: proposed_algorithm(*args, resource_search="soft_entropy_kkt_tau1", **kwargs),
+    }
     for run_seed in run_seeds:
         shared = load_mnist_data(
             num_users=max(user_counts),
@@ -3172,6 +3381,7 @@ def figure_8(contexts):
                 partition_order=cfg["training"]["mnist_partition_order"],
             )
             for name, runner in runners.items():
+                started = time.perf_counter()
                 output = runner(
                     data["users"],
                     MNISTFNN,
@@ -3184,6 +3394,8 @@ def figure_8(contexts):
                     seed=run_seed,
                     config=cfg,
                 )
+                elapsed = time.perf_counter() - started
+                timing_records[name].append({"axis_value": int(user_count), "seconds": elapsed})
                 seed_curves[name].append(output["metrics"]["accuracy"][-1])
         for name, values in seed_curves.items():
             curves_by_seed[name].append(values)
@@ -3191,6 +3403,7 @@ def figure_8(contexts):
     result = {
         "users": user_counts,
         "accuracy": curves,
+        "method_wall_time_seconds": _summarize_method_wall_times(timing_records, axis_label="users"),
         "hyperparameters": {
             "user_counts": user_counts,
             "samples_per_user": sample_pool,
@@ -3203,6 +3416,7 @@ def figure_8(contexts):
             "seeds": run_seeds,
             "seed_runs": len(run_seeds),
             "baseline_c_mode": cfg["training"]["baseline_c_mode"],
+            "continuous_soft_baselines": ["Continuous-LP(HiGHS)", "Soft-Entropy-KKT(tau=1)"],
         },
     }
     if plot:
@@ -3211,6 +3425,8 @@ def figure_8(contexts):
         ax.plot(user_counts, curves["baseline_a"], color="blue", linestyle=(0, (6, 4)), linewidth=2.0, label="Baseline a)")
         ax.plot(user_counts, curves["baseline_b"], color="red", linewidth=2.0, label="Baseline b)")
         ax.plot(user_counts, curves["baseline_c"], color="red", linestyle=":", linewidth=2.0, label="Baseline c)")
+        ax.plot(user_counts, curves["continuous_lp"], color="green", linestyle="-.", linewidth=2.0, label="Continuous-LP(HiGHS)")
+        ax.plot(user_counts, curves["soft_entropy_kkt"], color="purple", linestyle=(0, (2, 2)), linewidth=2.0, label="Soft-Entropy-KKT(tau=1)")
         ax.set_xlabel("Total number of users")
         ax.set_ylabel("Identification accuracy")
         ax.set_xlim(min(user_counts), max(user_counts))
@@ -3263,8 +3479,16 @@ def figure_9(contexts):
         raise ValueError("figure_9.runner_seed_mode must be 'same' or 'rb_offset'")
     run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
-    curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
-    runners = {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b, "baseline_c": baseline_c}
+    curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": [], "continuous_lp": [], "soft_entropy_kkt": []}
+    timing_records = {name: [] for name in curves_by_seed}
+    runners = {
+        "proposed": proposed_algorithm,
+        "baseline_a": baseline_a,
+        "baseline_b": baseline_b,
+        "baseline_c": baseline_c,
+        "continuous_lp": lambda *args, **kwargs: proposed_algorithm(*args, resource_search="continuous_lp", **kwargs),
+        "soft_entropy_kkt": lambda *args, **kwargs: proposed_algorithm(*args, resource_search="soft_entropy_kkt_tau1", **kwargs),
+    }
     for run_seed in run_seeds:
         data = load_mnist_data(
             num_users=len(samples_per_user),
@@ -3278,6 +3502,7 @@ def figure_9(contexts):
         for rb_count in rb_counts:
             for name, runner in runners.items():
                 runner_seed = run_seed if runner_seed_mode == "same" else run_seed * 1009 + int(rb_count)
+                started = time.perf_counter()
                 output = runner(
                     data["users"],
                     MNISTFNN,
@@ -3290,6 +3515,8 @@ def figure_9(contexts):
                     seed=runner_seed,
                     config=cfg,
                 )
+                elapsed = time.perf_counter() - started
+                timing_records[name].append({"axis_value": int(rb_count), "seconds": elapsed})
                 seed_curves[name].append(output["metrics"]["accuracy"][-1])
         for name, values in seed_curves.items():
             curves_by_seed[name].append(values)
@@ -3297,6 +3524,7 @@ def figure_9(contexts):
     result = {
         "rbs": rb_counts,
         "accuracy": curves,
+        "method_wall_time_seconds": _summarize_method_wall_times(timing_records, axis_label="rbs"),
         "hyperparameters": {
             "rb_counts": rb_counts,
             "samples_per_user": samples_per_user,
@@ -3316,6 +3544,7 @@ def figure_9(contexts):
             "mnist_train_order": cfg["training"]["mnist_train_order"],
             "mnist_partition_order": cfg["training"]["mnist_partition_order"],
             "force_first_round_success": cfg["training"]["force_first_round_success"],
+            "continuous_soft_baselines": ["Continuous-LP(HiGHS)", "Soft-Entropy-KKT(tau=1)"],
         },
     }
     if plot:
@@ -3324,6 +3553,8 @@ def figure_9(contexts):
         ax.plot(rb_counts, curves["baseline_a"], color="blue", linestyle=(0, (6, 4)), linewidth=2.0, label="Baseline a)")
         ax.plot(rb_counts, curves["baseline_b"], color="red", linewidth=2.0, label="Baseline b)")
         ax.plot(rb_counts, curves["baseline_c"], color="red", linestyle=":", linewidth=2.0, label="Baseline c)")
+        ax.plot(rb_counts, curves["continuous_lp"], color="green", linestyle="-.", linewidth=2.0, label="Continuous-LP(HiGHS)")
+        ax.plot(rb_counts, curves["soft_entropy_kkt"], color="purple", linestyle=(0, (2, 2)), linewidth=2.0, label="Soft-Entropy-KKT(tau=1)")
         ax.set_xlabel("Number of RBs")
         ax.set_ylabel("Identification accuracy")
         ax.set_xlim(min(rb_counts), max(rb_counts))
@@ -3476,6 +3707,20 @@ def main():
     selected = calls if args.figure == "all" else {args.figure: calls[args.figure]}
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    run_log_path = output_dir / "run_all.log"
+    with open(run_log_path, "w", encoding="utf-8") as handle:
+        handle.write(f"command: {' '.join(sys.argv)}\n")
+        handle.write(f"figure: {args.figure}\n")
+        handle.write(f"output_dir: {output_dir}\n")
+        handle.write(f"started_at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    def log(message, figure_log_path=None):
+        print(message)
+        with open(run_log_path, "a", encoding="utf-8") as handle:
+            print(message, file=handle, flush=True)
+        if figure_log_path is not None:
+            with open(figure_log_path, "a", encoding="utf-8") as handle:
+                print(message, file=handle, flush=True)
 
     def contexts_for_figure(name):
         config_path = Path(args.config) if args.config is not None else Path("configs") / f"figure_{name}.yaml"
@@ -3545,45 +3790,80 @@ def main():
         else:
             fig.tight_layout()
 
+    def json_default(value):
+        if isinstance(value, np.integer):
+            return int(value)
+        if isinstance(value, np.floating):
+            return float(value)
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, Path):
+            return str(value)
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
     planned = {name: contexts_for_figure(name) for name in selected}
     total_runs = sum(len(contexts) for contexts in planned.values())
-    print(f"planned_runs: {total_runs}")
+    log(f"planned_runs: {total_runs}")
     if total_runs >= 100:
-        print(f"warning: YAML expands to {total_runs} runs; narrow candidate lists if this is unintended.")
+        log(f"warning: YAML expands to {total_runs} runs; narrow candidate lists if this is unintended.")
 
-    for name, func in selected.items():
-        contexts = planned[name]
-        result = func(contexts)
-        save_path = None
-        if "figure" in result:
-            fig = result["figure"]
-            format_figure(fig, name)
+    try:
+        for name, func in selected.items():
+            contexts = planned[name]
+            save_path = None
             save_dir = output_dir / f"figure_{name}"
             save_dir.mkdir(parents=True, exist_ok=True)
-            save_path = save_dir / f"001_contexts_{len(contexts)}.png"
-            fig.savefig(save_path, dpi=200, bbox_inches="tight")
-            plt.close(fig)
+            figure_log_path = save_dir / "run.log"
+            with open(figure_log_path, "w", encoding="utf-8") as handle:
+                handle.write(f"figure: {name}\n")
+                handle.write(f"context_count: {len(contexts)}\n")
+                handle.write(f"started_at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            log(f"figure_{name}: started", figure_log_path)
 
-        printable = {"context_count": len(contexts)}
-        for key, value in result.items():
-            if key == "figure":
-                continue
-            if isinstance(value, np.ndarray):
-                printable[key] = {"shape": value.shape, "first": float(value.ravel()[0]) if value.size else None}
-            elif isinstance(value, tuple) and value and all(isinstance(item, np.ndarray) for item in value):
-                printable[key] = [{"shape": item.shape, "first": float(item.ravel()[0]) if item.size else None} for item in value]
-            elif isinstance(value, dict):
-                printable[key] = {}
-                for subkey, subvalue in value.items():
-                    if key == "loss" and isinstance(subvalue, list) and subvalue:
-                        printable[key][subkey] = subvalue[-1]
-                    else:
-                        printable[key][subkey] = subvalue
-            else:
-                printable[key] = value
-        print(f"figure_{name}: {printable}")
-        if save_path is not None:
-            print(f"saved: {save_path}")
+            result = func(contexts)
+            if "figure" in result:
+                fig = result["figure"]
+                format_figure(fig, name)
+                save_path = save_dir / f"001_contexts_{len(contexts)}.png"
+                fig.savefig(save_path, dpi=200, bbox_inches="tight")
+                plt.close(fig)
+
+            printable = {"context_count": len(contexts)}
+            for key, value in result.items():
+                if key == "figure":
+                    continue
+                if isinstance(value, np.ndarray):
+                    printable[key] = {"shape": value.shape, "first": float(value.ravel()[0]) if value.size else None}
+                elif isinstance(value, tuple) and value and all(isinstance(item, np.ndarray) for item in value):
+                    printable[key] = [{"shape": item.shape, "first": float(item.ravel()[0]) if item.size else None} for item in value]
+                elif isinstance(value, dict):
+                    printable[key] = {}
+                    for subkey, subvalue in value.items():
+                        if key == "loss" and isinstance(subvalue, list) and subvalue:
+                            printable[key][subkey] = subvalue[-1]
+                        else:
+                            printable[key][subkey] = subvalue
+                else:
+                    printable[key] = value
+            if save_path is not None:
+                printable["plot_path"] = str(save_path)
+            printable["figure_log_path"] = str(figure_log_path)
+            json_path = save_dir / f"001_contexts_{len(contexts)}.json"
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(printable, handle, ensure_ascii=False, indent=2, default=json_default)
+            log(f"figure_{name}: {printable}", figure_log_path)
+            if save_path is not None:
+                log(f"saved: {save_path}", figure_log_path)
+            log(f"saved_json: {json_path}", figure_log_path)
+            log(f"saved_log: {figure_log_path}", figure_log_path)
+        log(f"finished_at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        log(f"saved_run_log: {run_log_path}")
+    except Exception:
+        error_text = traceback.format_exc()
+        with open(run_log_path, "a", encoding="utf-8") as handle:
+            handle.write(error_text)
+        print(error_text, file=sys.stderr)
+        raise
 
 
 if __name__ == "__main__":

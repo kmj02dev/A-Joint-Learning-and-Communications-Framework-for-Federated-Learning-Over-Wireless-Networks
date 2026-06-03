@@ -1,0 +1,18 @@
+{
+  "context_count": 1,
+  "proposed_accuracy": 0.8559,
+  "baseline_b_accuracy": 0.8581,
+  "proposed_correct": 8559,
+  "baseline_b_correct": 8581,
+  "n_examples": 10000,
+  "hyperparameters": {
+    "samples_per_user": 2000,
+    "test_samples": 10000,
+    "rounds": 130,
+    "num_rbs": 12,
+    "local_epochs": 1,
+    "learning_rate": 0.08
+  },
+  "plot_path": "outputs/gpu_run_20260603_2003/figure_10/001_contexts_1.png",
+  "figure_log_path": "outputs/gpu_run_20260603_2003/figure_10/run.log"
+}
