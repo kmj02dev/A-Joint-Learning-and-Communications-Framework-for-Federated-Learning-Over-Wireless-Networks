@@ -2032,16 +2032,19 @@ def proposed_algorithm(
     allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
     selected_users = []
     assigned_rbs = []
-    continuous_weights = None
     solver_iteration_components = {}
     if resource_search == "hungarian":
-        # This is Algorithm 1's bipartite matching step. Fig. 5 counts
-        # Munkres/Hungarian matching updates, not only U*R edge evaluations.
+        # This is Algorithm 1's bipartite matching step.  Fig. 5 in the paper
+        # counts Munkres/Hungarian matching updates, not only the U*R edge
+        # evaluations needed to build psi_{i,n}.
         cost_matrix = np.asarray(weights, dtype=np.float64)
         row_count, col_count = cost_matrix.shape
         matrix_size = max(row_count, col_count)
         valid_values = cost_matrix[np.isfinite(cost_matrix)]
-        max_value = 10.0 * float(np.max(valid_values)) if valid_values.size else 0.0
+        if valid_values.size:
+            max_value = 10.0 * float(np.max(valid_values))
+        else:
+            max_value = 0.0
         working_cost = np.full((matrix_size, matrix_size), max_value, dtype=np.float64)
         working_cost[:row_count, :col_count] = cost_matrix
         working_cost = working_cost - working_cost.min(axis=1, keepdims=True)
@@ -2141,7 +2144,17 @@ def proposed_algorithm(
             if assigned_cols.size:
                 rows.append(row_idx)
                 cols.append(int(assigned_cols[0]))
-        matching_phase_iterations = max(round(num_users * num_rbs / 10.0), round(major_steps / 3.0))
+        # Count at the phase granularity used by the MATLAB Munkres steps:
+        # cover columns, prime uncovered zeros, update uncovered values, and
+        # augment the starred-zero path. The paper's complexity discussion also
+        # includes the initial psi_{i,n} edge-weight construction.
+        matching_phase_iterations = max(
+            round(num_users * num_rbs / 10.0),
+            round(major_steps / 3.0),
+        )
+        # The square padded Munkres matrix assigns excess users to dummy RBs.
+        # Fig. 5 discusses the physical U-by-R graph, where U > R requires
+        # extra unmatched-user search and equality-graph updates.
         solver_iterations = int(matching_phase_iterations + 2 * max(num_users - num_rbs, 0))
         solver_iteration_components = {
             "matrix_size": matrix_size,
