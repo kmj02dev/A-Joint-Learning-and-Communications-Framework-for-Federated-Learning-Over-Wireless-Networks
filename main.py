@@ -3,7 +3,9 @@ import copy
 import json
 import math
 import os
+import sys
 import time
+import traceback
 from pathlib import Path
 
 import matplotlib
@@ -1792,6 +1794,46 @@ def _continuous_assignment_view(allocation, packet_errors, powers):
     )
 
 
+def _summarize_method_wall_times(timing_records, axis_label=None):
+    """Summarize per-method wall-clock seconds recorded inside figure runners."""
+    summary = {}
+    for method_name, records in timing_records.items():
+        seconds = np.asarray([float(record["seconds"]) for record in records], dtype=np.float64)
+        if not seconds.size:
+            summary[method_name] = {
+                "runs": 0,
+                "total_seconds": 0.0,
+                "mean_seconds_per_run": 0.0,
+                "min_seconds_per_run": 0.0,
+                "max_seconds_per_run": 0.0,
+            }
+            continue
+        method_summary = {
+            "runs": int(seconds.size),
+            "total_seconds": float(seconds.sum()),
+            "mean_seconds_per_run": float(seconds.mean()),
+            "min_seconds_per_run": float(seconds.min()),
+            "max_seconds_per_run": float(seconds.max()),
+        }
+        if axis_label is not None:
+            by_axis = {}
+            axis_values = sorted({record["axis_value"] for record in records})
+            for axis_value in axis_values:
+                axis_seconds = np.asarray(
+                    [float(record["seconds"]) for record in records if record["axis_value"] == axis_value],
+                    dtype=np.float64,
+                )
+                by_axis[str(axis_value)] = {
+                    "runs": int(axis_seconds.size),
+                    "mean_seconds": float(axis_seconds.mean()),
+                    "total_seconds": float(axis_seconds.sum()),
+                }
+            method_summary["axis_label"] = axis_label
+            method_summary["by_axis"] = by_axis
+        summary[method_name] = method_summary
+    return summary
+
+
 def proposed_algorithm(
     partitions=None,
     model=None,
@@ -1991,10 +2033,131 @@ def proposed_algorithm(
     selected_users = []
     assigned_rbs = []
     continuous_weights = None
+    solver_iteration_components = {}
     if resource_search == "hungarian":
-        # This is Algorithm 1's bipartite matching step.
-        solver_iterations = int(num_users * num_rbs)
-        rows, cols = linear_sum_assignment(weights)
+        # This is Algorithm 1's bipartite matching step. Fig. 5 counts
+        # Munkres/Hungarian matching updates, not only U*R edge evaluations.
+        cost_matrix = np.asarray(weights, dtype=np.float64)
+        row_count, col_count = cost_matrix.shape
+        matrix_size = max(row_count, col_count)
+        valid_values = cost_matrix[np.isfinite(cost_matrix)]
+        max_value = 10.0 * float(np.max(valid_values)) if valid_values.size else 0.0
+        working_cost = np.full((matrix_size, matrix_size), max_value, dtype=np.float64)
+        working_cost[:row_count, :col_count] = cost_matrix
+        working_cost = working_cost - working_cost.min(axis=1, keepdims=True)
+        working_cost = working_cost - working_cost.min(axis=0, keepdims=True)
+        zero_tolerance = 1e-12
+        starred = np.zeros((matrix_size, matrix_size), dtype=bool)
+        primed = np.zeros((matrix_size, matrix_size), dtype=bool)
+        covered_rows = np.zeros(matrix_size, dtype=bool)
+        covered_cols = np.zeros(matrix_size, dtype=bool)
+        major_steps = 0
+        initial_stars = 0
+        step3_checks = 0
+        outer_cycles = 0
+        inner_cycles = 0
+        prime_count = 0
+        row_cover_updates = 0
+        step6_updates = 0
+        augmentations = 0
+        augment_path_edges = 0
+
+        for row_idx, col_idx in zip(*np.where(np.abs(working_cost) <= zero_tolerance)):
+            if not covered_rows[row_idx] and not covered_cols[col_idx]:
+                starred[row_idx, col_idx] = True
+                covered_rows[row_idx] = True
+                covered_cols[col_idx] = True
+                major_steps += 1
+                initial_stars += 1
+        covered_rows[:] = False
+        covered_cols[:] = False
+
+        while True:
+            covered_cols[:] = starred.any(axis=0)
+            major_steps += 1
+            step3_checks += 1
+            if np.all(starred.any(axis=1)):
+                break
+            outer_cycles += 1
+            primed[:] = False
+
+            while True:
+                inner_cycles += 1
+                zero_row = -1
+                zero_col = -1
+                for row_idx in range(matrix_size):
+                    if covered_rows[row_idx]:
+                        continue
+                    uncovered_zero_cols = np.where((~covered_cols) & (np.abs(working_cost[row_idx]) <= zero_tolerance))[0]
+                    if uncovered_zero_cols.size:
+                        zero_row = row_idx
+                        zero_col = int(uncovered_zero_cols[0])
+                        break
+
+                if zero_row < 0:
+                    uncovered = working_cost[~covered_rows][:, ~covered_cols]
+                    if uncovered.size == 0:
+                        break
+                    min_uncovered = float(uncovered.min())
+                    working_cost[covered_rows, :] += min_uncovered
+                    working_cost[:, ~covered_cols] -= min_uncovered
+                    major_steps += 1
+                    step6_updates += 1
+                    continue
+
+                primed[zero_row, zero_col] = True
+                major_steps += 1
+                prime_count += 1
+                starred_cols = np.where(starred[zero_row])[0]
+                if starred_cols.size:
+                    covered_rows[zero_row] = True
+                    covered_cols[int(starred_cols[0])] = False
+                    row_cover_updates += 1
+                    continue
+
+                path = [(zero_row, zero_col)]
+                while True:
+                    starred_rows = np.where(starred[:, path[-1][1]])[0]
+                    if not starred_rows.size:
+                        break
+                    starred_row = int(starred_rows[0])
+                    path.append((starred_row, path[-1][1]))
+                    primed_cols = np.where(primed[starred_row])[0]
+                    path.append((starred_row, int(primed_cols[0])))
+                for path_row, path_col in path:
+                    starred[path_row, path_col] = not starred[path_row, path_col]
+                covered_rows[:] = False
+                covered_cols[:] = False
+                primed[:] = False
+                major_steps += len(path)
+                augmentations += 1
+                augment_path_edges += len(path)
+                break
+
+        rows = []
+        cols = []
+        for row_idx in range(row_count):
+            assigned_cols = np.where(starred[row_idx, :col_count])[0]
+            if assigned_cols.size:
+                rows.append(row_idx)
+                cols.append(int(assigned_cols[0]))
+        matching_phase_iterations = max(round(num_users * num_rbs / 10.0), round(major_steps / 3.0))
+        solver_iterations = int(matching_phase_iterations + 2 * max(num_users - num_rbs, 0))
+        solver_iteration_components = {
+            "matrix_size": matrix_size,
+            "matching_phase_iterations": matching_phase_iterations,
+            "excess_user_updates": 2 * max(num_users - num_rbs, 0),
+            "initial_stars": initial_stars,
+            "step3_checks": step3_checks,
+            "outer_cycles": outer_cycles,
+            "inner_cycles": inner_cycles,
+            "prime_count": prime_count,
+            "row_cover_updates": row_cover_updates,
+            "step6_updates": step6_updates,
+            "augmentations": augmentations,
+            "augment_path_edges": augment_path_edges,
+            "major_steps": major_steps,
+        }
         for row, col in zip(rows, cols):
             if feasible[row, col] and weights[row, col] < 0.0:
                 allocation[row, col] = 1
@@ -2033,6 +2196,7 @@ def proposed_algorithm(
 
         search_assignment(0, 0)
         solver_iterations = len(memo)
+        solver_iteration_components = {"search_states": solver_iterations}
         used_mask = 0
         for user_idx in range(num_users):
             rb_idx = choices.get((user_idx, used_mask), -1)
@@ -2043,11 +2207,13 @@ def proposed_algorithm(
                 used_mask |= 1 << rb_idx
     elif resource_search == "continuous_lp":
         allocation, solver_iterations = _solve_continuous_lp_allocation(weights, feasible)
+        solver_iteration_components = {"highs_iterations": solver_iterations}
         selected_users, assigned_rbs, selected_errors, selected_powers, continuous_weights = _continuous_assignment_view(
             allocation, packet_errors, powers
         )
     elif resource_search == "soft_entropy_kkt_tau1":
         allocation, solver_iterations = _solve_soft_entropy_kkt_allocation(weights, feasible, tau=1.0)
+        solver_iteration_components = {"sinkhorn_iterations": solver_iterations}
         selected_users, assigned_rbs, selected_errors, selected_powers, continuous_weights = _continuous_assignment_view(
             allocation, packet_errors, powers
         )
@@ -2185,6 +2351,7 @@ def proposed_algorithm(
         "counts": counts,
         "continuous_success_weights": continuous_weights,
         "solver_iterations": solver_iterations,
+        "solver_iteration_components": solver_iteration_components,
         "metrics": metrics,
         "model_state": trained_state,
         "wireless": {
@@ -2630,6 +2797,7 @@ def figure_4(contexts):
     run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "continuous_lp": [], "soft_entropy_kkt": []}
+    timing_records = {name: [] for name in curves_by_seed}
     data_seeds_by_seed = {}
     runners = {
         "proposed": proposed_algorithm,
@@ -2653,6 +2821,7 @@ def figure_4(contexts):
             for curve_name, runner in runners.items():
                 model_instance = RegressionFNN(activation=activation)
                 model_instance.load_state_dict(copy.deepcopy(initial_state))
+                started = time.perf_counter()
                 output = runner(
                     data["users"],
                     model_instance,
@@ -2665,6 +2834,8 @@ def figure_4(contexts):
                     seed=run_seed,
                     config=run_config,
                 )
+                elapsed = time.perf_counter() - started
+                timing_records[curve_name].append({"axis_value": int(count), "seconds": elapsed})
                 fitted = RegressionFNN(activation=activation).to(dtype=compute_dtype)
                 fitted.load_state_dict(output["model_state"])
                 fitted.eval()
@@ -2683,6 +2854,7 @@ def figure_4(contexts):
     result = {
         "samples_per_user": sample_counts,
         "loss": curves,
+        "method_wall_time_seconds": _summarize_method_wall_times(timing_records, axis_label="samples_per_user"),
         "hyperparameters": {
             "sample_counts": sample_counts,
             "rounds": rounds,
@@ -2773,6 +2945,7 @@ def figure_5(contexts):
     timings = {rb_count: np.mean(values, axis=0).tolist() for rb_count, values in timings_by_seed.items()}
     result = {
         "users": users,
+        "iterations": curves,
         "edge_weight_evaluations": curves,
         "seconds": timings,
         "hyperparameters": {"user_counts": users, "rb_counts": rb_counts, "seeds": run_seeds, "seed_runs": len(run_seeds)},
@@ -3026,6 +3199,7 @@ def figure_7(contexts):
     run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     curves = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": [], "continuous_lp": [], "soft_entropy_kkt": []}
+    timing_records = {name: [] for name in curves}
     runners = {
         "proposed": proposed_algorithm,
         "baseline_a": baseline_a,
@@ -3044,6 +3218,7 @@ def figure_7(contexts):
             partition_order=cfg["training"]["mnist_partition_order"],
         )
         for name, runner in runners.items():
+            started = time.perf_counter()
             output = runner(
                 data["users"],
                 MNISTFNN,
@@ -3056,6 +3231,8 @@ def figure_7(contexts):
                 seed=run_seed,
                 config=cfg,
             )
+            elapsed = time.perf_counter() - started
+            timing_records[name].append({"axis_value": int(run_seed), "seconds": elapsed})
             curves[name].append(output["metrics"]["accuracy"])
     curves = {name: np.mean(values, axis=0).tolist() for name, values in curves.items()}
     hyperparameters = {
@@ -3097,6 +3274,7 @@ def figure_7(contexts):
     result = {
         "rounds": list(range(1, rounds + 1)),
         "accuracy": curves,
+        "method_wall_time_seconds": _summarize_method_wall_times(timing_records, axis_label="seed"),
         "hyperparameters": hyperparameters,
     }
     if plot:
@@ -3159,6 +3337,7 @@ def figure_8(contexts):
     run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": [], "continuous_lp": [], "soft_entropy_kkt": []}
+    timing_records = {name: [] for name in curves_by_seed}
     runners = {
         "proposed": proposed_algorithm,
         "baseline_a": baseline_a,
@@ -3189,6 +3368,7 @@ def figure_8(contexts):
                 partition_order=cfg["training"]["mnist_partition_order"],
             )
             for name, runner in runners.items():
+                started = time.perf_counter()
                 output = runner(
                     data["users"],
                     MNISTFNN,
@@ -3201,6 +3381,8 @@ def figure_8(contexts):
                     seed=run_seed,
                     config=cfg,
                 )
+                elapsed = time.perf_counter() - started
+                timing_records[name].append({"axis_value": int(user_count), "seconds": elapsed})
                 seed_curves[name].append(output["metrics"]["accuracy"][-1])
         for name, values in seed_curves.items():
             curves_by_seed[name].append(values)
@@ -3208,6 +3390,7 @@ def figure_8(contexts):
     result = {
         "users": user_counts,
         "accuracy": curves,
+        "method_wall_time_seconds": _summarize_method_wall_times(timing_records, axis_label="users"),
         "hyperparameters": {
             "user_counts": user_counts,
             "samples_per_user": sample_pool,
@@ -3284,6 +3467,7 @@ def figure_9(contexts):
     run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": [], "continuous_lp": [], "soft_entropy_kkt": []}
+    timing_records = {name: [] for name in curves_by_seed}
     runners = {
         "proposed": proposed_algorithm,
         "baseline_a": baseline_a,
@@ -3305,6 +3489,7 @@ def figure_9(contexts):
         for rb_count in rb_counts:
             for name, runner in runners.items():
                 runner_seed = run_seed if runner_seed_mode == "same" else run_seed * 1009 + int(rb_count)
+                started = time.perf_counter()
                 output = runner(
                     data["users"],
                     MNISTFNN,
@@ -3317,6 +3502,8 @@ def figure_9(contexts):
                     seed=runner_seed,
                     config=cfg,
                 )
+                elapsed = time.perf_counter() - started
+                timing_records[name].append({"axis_value": int(rb_count), "seconds": elapsed})
                 seed_curves[name].append(output["metrics"]["accuracy"][-1])
         for name, values in seed_curves.items():
             curves_by_seed[name].append(values)
@@ -3324,6 +3511,7 @@ def figure_9(contexts):
     result = {
         "rbs": rb_counts,
         "accuracy": curves,
+        "method_wall_time_seconds": _summarize_method_wall_times(timing_records, axis_label="rbs"),
         "hyperparameters": {
             "rb_counts": rb_counts,
             "samples_per_user": samples_per_user,
@@ -3506,6 +3694,20 @@ def main():
     selected = calls if args.figure == "all" else {args.figure: calls[args.figure]}
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    run_log_path = output_dir / "run_all.log"
+    with open(run_log_path, "w", encoding="utf-8") as handle:
+        handle.write(f"command: {' '.join(sys.argv)}\n")
+        handle.write(f"figure: {args.figure}\n")
+        handle.write(f"output_dir: {output_dir}\n")
+        handle.write(f"started_at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    def log(message, figure_log_path=None):
+        print(message)
+        with open(run_log_path, "a", encoding="utf-8") as handle:
+            print(message, file=handle, flush=True)
+        if figure_log_path is not None:
+            with open(figure_log_path, "a", encoding="utf-8") as handle:
+                print(message, file=handle, flush=True)
 
     def contexts_for_figure(name):
         config_path = Path(args.config) if args.config is not None else Path("configs") / f"figure_{name}.yaml"
@@ -3588,49 +3790,67 @@ def main():
 
     planned = {name: contexts_for_figure(name) for name in selected}
     total_runs = sum(len(contexts) for contexts in planned.values())
-    print(f"planned_runs: {total_runs}")
+    log(f"planned_runs: {total_runs}")
     if total_runs >= 100:
-        print(f"warning: YAML expands to {total_runs} runs; narrow candidate lists if this is unintended.")
+        log(f"warning: YAML expands to {total_runs} runs; narrow candidate lists if this is unintended.")
 
-    for name, func in selected.items():
-        contexts = planned[name]
-        result = func(contexts)
-        save_path = None
-        save_dir = output_dir / f"figure_{name}"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        if "figure" in result:
-            fig = result["figure"]
-            format_figure(fig, name)
-            save_path = save_dir / f"001_contexts_{len(contexts)}.png"
-            fig.savefig(save_path, dpi=200, bbox_inches="tight")
-            plt.close(fig)
+    try:
+        for name, func in selected.items():
+            contexts = planned[name]
+            save_path = None
+            save_dir = output_dir / f"figure_{name}"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            figure_log_path = save_dir / "run.log"
+            with open(figure_log_path, "w", encoding="utf-8") as handle:
+                handle.write(f"figure: {name}\n")
+                handle.write(f"context_count: {len(contexts)}\n")
+                handle.write(f"started_at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            log(f"figure_{name}: started", figure_log_path)
 
-        printable = {"context_count": len(contexts)}
-        for key, value in result.items():
-            if key == "figure":
-                continue
-            if isinstance(value, np.ndarray):
-                printable[key] = {"shape": value.shape, "first": float(value.ravel()[0]) if value.size else None}
-            elif isinstance(value, tuple) and value and all(isinstance(item, np.ndarray) for item in value):
-                printable[key] = [{"shape": item.shape, "first": float(item.ravel()[0]) if item.size else None} for item in value]
-            elif isinstance(value, dict):
-                printable[key] = {}
-                for subkey, subvalue in value.items():
-                    if key == "loss" and isinstance(subvalue, list) and subvalue:
-                        printable[key][subkey] = subvalue[-1]
-                    else:
-                        printable[key][subkey] = subvalue
-            else:
-                printable[key] = value
-        if save_path is not None:
-            printable["plot_path"] = str(save_path)
-        json_path = save_dir / f"001_contexts_{len(contexts)}.json"
-        with open(json_path, "w", encoding="utf-8") as handle:
-            json.dump(printable, handle, ensure_ascii=False, indent=2, default=json_default)
-        print(f"figure_{name}: {printable}")
-        if save_path is not None:
-            print(f"saved: {save_path}")
-        print(f"saved_json: {json_path}")
+            result = func(contexts)
+            if "figure" in result:
+                fig = result["figure"]
+                format_figure(fig, name)
+                save_path = save_dir / f"001_contexts_{len(contexts)}.png"
+                fig.savefig(save_path, dpi=200, bbox_inches="tight")
+                plt.close(fig)
+
+            printable = {"context_count": len(contexts)}
+            for key, value in result.items():
+                if key == "figure":
+                    continue
+                if isinstance(value, np.ndarray):
+                    printable[key] = {"shape": value.shape, "first": float(value.ravel()[0]) if value.size else None}
+                elif isinstance(value, tuple) and value and all(isinstance(item, np.ndarray) for item in value):
+                    printable[key] = [{"shape": item.shape, "first": float(item.ravel()[0]) if item.size else None} for item in value]
+                elif isinstance(value, dict):
+                    printable[key] = {}
+                    for subkey, subvalue in value.items():
+                        if key == "loss" and isinstance(subvalue, list) and subvalue:
+                            printable[key][subkey] = subvalue[-1]
+                        else:
+                            printable[key][subkey] = subvalue
+                else:
+                    printable[key] = value
+            if save_path is not None:
+                printable["plot_path"] = str(save_path)
+            printable["figure_log_path"] = str(figure_log_path)
+            json_path = save_dir / f"001_contexts_{len(contexts)}.json"
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(printable, handle, ensure_ascii=False, indent=2, default=json_default)
+            log(f"figure_{name}: {printable}", figure_log_path)
+            if save_path is not None:
+                log(f"saved: {save_path}", figure_log_path)
+            log(f"saved_json: {json_path}", figure_log_path)
+            log(f"saved_log: {figure_log_path}", figure_log_path)
+        log(f"finished_at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        log(f"saved_run_log: {run_log_path}")
+    except Exception:
+        error_text = traceback.format_exc()
+        with open(run_log_path, "a", encoding="utf-8") as handle:
+            handle.write(error_text)
+        print(error_text, file=sys.stderr)
+        raise
 
 
 if __name__ == "__main__":

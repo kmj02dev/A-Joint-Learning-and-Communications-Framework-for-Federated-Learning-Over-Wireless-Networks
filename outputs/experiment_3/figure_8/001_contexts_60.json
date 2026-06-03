@@ -1,0 +1,359 @@
+{
+  "context_count": 60,
+  "users": [
+    3,
+    6,
+    9,
+    12,
+    15,
+    18
+  ],
+  "accuracy": {
+    "proposed": [
+      0.81042,
+      0.8421900000000001,
+      0.8468300000000001,
+      0.8508100000000001,
+      0.8537399999999999,
+      0.8553900000000001
+    ],
+    "baseline_a": [
+      0.50717,
+      0.67508,
+      0.83234,
+      0.83682,
+      0.8434100000000001,
+      0.84971
+    ],
+    "baseline_b": [
+      0.50717,
+      0.74475,
+      0.83097,
+      0.84396,
+      0.84848,
+      0.84393
+    ],
+    "baseline_c": [
+      0.8115600000000001,
+      0.8384900000000002,
+      0.8447799999999999,
+      0.8497899999999999,
+      0.8534499999999999,
+      0.8551500000000001
+    ],
+    "continuous_lp": [
+      0.8107999999999999,
+      0.8421500000000002,
+      0.84669,
+      0.8507800000000001,
+      0.8537699999999999,
+      0.8550599999999999
+    ],
+    "soft_entropy_kkt": [
+      0.8107300000000001,
+      0.8423999999999999,
+      0.8467499999999999,
+      0.8507300000000001,
+      0.8538400000000002,
+      0.85534
+    ]
+  },
+  "method_wall_time_seconds": {
+    "proposed": {
+      "runs": 60,
+      "total_seconds": 662.4382300094003,
+      "mean_seconds_per_run": 11.040637166823338,
+      "min_seconds_per_run": 9.067579110036604,
+      "max_seconds_per_run": 12.970253119012341,
+      "axis_label": "users",
+      "by_axis": {
+        "3": {
+          "runs": 10,
+          "mean_seconds": 9.365032077417709,
+          "total_seconds": 93.65032077417709
+        },
+        "6": {
+          "runs": 10,
+          "mean_seconds": 10.452896987798159,
+          "total_seconds": 104.52896987798158
+        },
+        "9": {
+          "runs": 10,
+          "mean_seconds": 10.833234248810914,
+          "total_seconds": 108.33234248810913
+        },
+        "12": {
+          "runs": 10,
+          "mean_seconds": 11.433768119220622,
+          "total_seconds": 114.33768119220622
+        },
+        "15": {
+          "runs": 10,
+          "mean_seconds": 11.918318051402457,
+          "total_seconds": 119.18318051402457
+        },
+        "18": {
+          "runs": 10,
+          "mean_seconds": 12.24057351629017,
+          "total_seconds": 122.40573516290169
+        }
+      }
+    },
+    "baseline_a": {
+      "runs": 60,
+      "total_seconds": 659.2843396411045,
+      "mean_seconds_per_run": 10.988072327351741,
+      "min_seconds_per_run": 9.042362218955532,
+      "max_seconds_per_run": 12.81149346800521,
+      "axis_label": "users",
+      "by_axis": {
+        "3": {
+          "runs": 10,
+          "mean_seconds": 9.312503298104275,
+          "total_seconds": 93.12503298104275
+        },
+        "6": {
+          "runs": 10,
+          "mean_seconds": 10.3885050003184,
+          "total_seconds": 103.885050003184
+        },
+        "9": {
+          "runs": 10,
+          "mean_seconds": 10.87444061730057,
+          "total_seconds": 108.7444061730057
+        },
+        "12": {
+          "runs": 10,
+          "mean_seconds": 11.376311000005808,
+          "total_seconds": 113.76311000005808
+        },
+        "15": {
+          "runs": 10,
+          "mean_seconds": 11.840687770501244,
+          "total_seconds": 118.40687770501245
+        },
+        "18": {
+          "runs": 10,
+          "mean_seconds": 12.135986277880146,
+          "total_seconds": 121.35986277880147
+        }
+      }
+    },
+    "baseline_b": {
+      "runs": 60,
+      "total_seconds": 711.6705384727102,
+      "mean_seconds_per_run": 11.861175641211837,
+      "min_seconds_per_run": 9.206570116919465,
+      "max_seconds_per_run": 13.583111500949599,
+      "axis_label": "users",
+      "by_axis": {
+        "3": {
+          "runs": 10,
+          "mean_seconds": 9.342052773793693,
+          "total_seconds": 93.42052773793694
+        },
+        "6": {
+          "runs": 10,
+          "mean_seconds": 10.846431390289217,
+          "total_seconds": 108.46431390289217
+        },
+        "9": {
+          "runs": 10,
+          "mean_seconds": 11.798990213195793,
+          "total_seconds": 117.98990213195793
+        },
+        "12": {
+          "runs": 10,
+          "mean_seconds": 12.850793997687287,
+          "total_seconds": 128.50793997687288
+        },
+        "15": {
+          "runs": 10,
+          "mean_seconds": 13.211125858791638,
+          "total_seconds": 132.11125858791638
+        },
+        "18": {
+          "runs": 10,
+          "mean_seconds": 13.117659613513387,
+          "total_seconds": 131.17659613513388
+        }
+      }
+    },
+    "baseline_c": {
+      "runs": 60,
+      "total_seconds": 651.1296442175517,
+      "mean_seconds_per_run": 10.852160736959195,
+      "min_seconds_per_run": 9.069872736930847,
+      "max_seconds_per_run": 12.338046677061357,
+      "axis_label": "users",
+      "by_axis": {
+        "3": {
+          "runs": 10,
+          "mean_seconds": 9.420240454503801,
+          "total_seconds": 94.20240454503801
+        },
+        "6": {
+          "runs": 10,
+          "mean_seconds": 10.306416885706131,
+          "total_seconds": 103.0641688570613
+        },
+        "9": {
+          "runs": 10,
+          "mean_seconds": 10.71307561218273,
+          "total_seconds": 107.13075612182729
+        },
+        "12": {
+          "runs": 10,
+          "mean_seconds": 11.168798466026782,
+          "total_seconds": 111.68798466026783
+        },
+        "15": {
+          "runs": 10,
+          "mean_seconds": 11.620583231817,
+          "total_seconds": 116.20583231817
+        },
+        "18": {
+          "runs": 10,
+          "mean_seconds": 11.883849771518726,
+          "total_seconds": 118.83849771518726
+        }
+      }
+    },
+    "continuous_lp": {
+      "runs": 60,
+      "total_seconds": 664.9637039514491,
+      "mean_seconds_per_run": 11.082728399190819,
+      "min_seconds_per_run": 9.216441291035153,
+      "max_seconds_per_run": 12.856417673989199,
+      "axis_label": "users",
+      "by_axis": {
+        "3": {
+          "runs": 10,
+          "mean_seconds": 9.370711950713304,
+          "total_seconds": 93.70711950713303
+        },
+        "6": {
+          "runs": 10,
+          "mean_seconds": 10.48555186361773,
+          "total_seconds": 104.8555186361773
+        },
+        "9": {
+          "runs": 10,
+          "mean_seconds": 10.916866183793172,
+          "total_seconds": 109.16866183793172
+        },
+        "12": {
+          "runs": 10,
+          "mean_seconds": 11.437595164706,
+          "total_seconds": 114.37595164705999
+        },
+        "15": {
+          "runs": 10,
+          "mean_seconds": 12.019756658806,
+          "total_seconds": 120.19756658806
+        },
+        "18": {
+          "runs": 10,
+          "mean_seconds": 12.26588857350871,
+          "total_seconds": 122.6588857350871
+        }
+      }
+    },
+    "soft_entropy_kkt": {
+      "runs": 60,
+      "total_seconds": 697.8503554710187,
+      "mean_seconds_per_run": 11.630839257850312,
+      "min_seconds_per_run": 9.300723984022625,
+      "max_seconds_per_run": 14.117435890017077,
+      "axis_label": "users",
+      "by_axis": {
+        "3": {
+          "runs": 10,
+          "mean_seconds": 9.391314176702872,
+          "total_seconds": 93.91314176702872
+        },
+        "6": {
+          "runs": 10,
+          "mean_seconds": 10.766038341191598,
+          "total_seconds": 107.66038341191597
+        },
+        "9": {
+          "runs": 10,
+          "mean_seconds": 11.279724824219011,
+          "total_seconds": 112.79724824219011
+        },
+        "12": {
+          "runs": 10,
+          "mean_seconds": 12.10716157470597,
+          "total_seconds": 121.0716157470597
+        },
+        "15": {
+          "runs": 10,
+          "mean_seconds": 12.829355145595036,
+          "total_seconds": 128.29355145595036
+        },
+        "18": {
+          "runs": 10,
+          "mean_seconds": 13.411441484687384,
+          "total_seconds": 134.11441484687384
+        }
+      }
+    }
+  },
+  "hyperparameters": {
+    "user_counts": [
+      3,
+      6,
+      9,
+      12,
+      15,
+      18
+    ],
+    "samples_per_user": [
+      100,
+      200,
+      300,
+      400,
+      500,
+      400,
+      300,
+      200,
+      100,
+      200,
+      300,
+      400,
+      500,
+      600,
+      100,
+      200,
+      300,
+      400
+    ],
+    "test_samples": 10000,
+    "rounds": 130,
+    "num_rbs": 12,
+    "local_epochs": 1,
+    "optimizer": "full_batch_gradient_descent",
+    "learning_rate": 0.08,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "seed_runs": 10,
+    "baseline_c_mode": "current",
+    "continuous_soft_baselines": [
+      "Continuous-LP(HiGHS)",
+      "Soft-Entropy-KKT(tau=1)"
+    ]
+  },
+  "plot_path": "outputs/gpu_run_20260603_2003/figure_8/001_contexts_60.png",
+  "figure_log_path": "outputs/gpu_run_20260603_2003/figure_8/run.log"
+}

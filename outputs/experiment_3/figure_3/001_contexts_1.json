@@ -1,0 +1,62 @@
+{
+  "context_count": 1,
+  "hyperparameters": {
+    "data_count": 50,
+    "test_count": 1000,
+    "rounds": 130,
+    "num_rbs": 9,
+    "local_epochs": 1,
+    "optimizer": "full_batch_gradient_descent",
+    "activation": "tanh",
+    "learning_rate": 0.01,
+    "quantization_bits": 16,
+    "compute_dtype": "float32",
+    "loss_function": "nmse",
+    "optimal_resource_search": "heuristic"
+  },
+  "optimal": {
+    "loss": 0.04537741810860757,
+    "selected": 9,
+    "solver_iterations": 5888
+  },
+  "proposed": {
+    "loss": 0.04537741810860757,
+    "selected": 9
+  },
+  "baseline_a": {
+    "loss": 0.05195395594994364,
+    "selected": 9
+  },
+  "baseline_b": {
+    "loss": 0.06366559868109006,
+    "selected": 9
+  },
+  "x_grid": {
+    "shape": [
+      100
+    ],
+    "first": 0.0
+  },
+  "noise_free_prediction": {
+    "shape": [
+      100
+    ],
+    "first": 1.0
+  },
+  "samples": [
+    {
+      "shape": [
+        50
+      ],
+      "first": 0.08925092220306396
+    },
+    {
+      "shape": [
+        50
+      ],
+      "first": 1.1216785907745361
+    }
+  ],
+  "plot_path": "outputs/gpu_run_20260603_2003/figure_3/001_contexts_1.png",
+  "figure_log_path": "outputs/gpu_run_20260603_2003/figure_3/run.log"
+}
