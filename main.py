@@ -1865,6 +1865,7 @@ def proposed_algorithm(
     allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
     selected_users = []
     assigned_rbs = []
+    solver_iteration_components = {}
     if resource_search == "hungarian":
         # This is Algorithm 1's bipartite matching step.  Fig. 5 in the paper
         # counts Munkres/Hungarian matching updates, not only the U*R edge
@@ -1887,6 +1888,15 @@ def proposed_algorithm(
         covered_rows = np.zeros(matrix_size, dtype=bool)
         covered_cols = np.zeros(matrix_size, dtype=bool)
         major_steps = 0
+        initial_stars = 0
+        step3_checks = 0
+        outer_cycles = 0
+        inner_cycles = 0
+        prime_count = 0
+        row_cover_updates = 0
+        step6_updates = 0
+        augmentations = 0
+        augment_path_edges = 0
 
         for row_idx, col_idx in zip(*np.where(np.abs(working_cost) <= zero_tolerance)):
             if not covered_rows[row_idx] and not covered_cols[col_idx]:
@@ -1894,17 +1904,21 @@ def proposed_algorithm(
                 covered_rows[row_idx] = True
                 covered_cols[col_idx] = True
                 major_steps += 1
+                initial_stars += 1
         covered_rows[:] = False
         covered_cols[:] = False
 
         while True:
             covered_cols[:] = starred.any(axis=0)
             major_steps += 1
+            step3_checks += 1
             if np.all(starred.any(axis=1)):
                 break
+            outer_cycles += 1
             primed[:] = False
 
             while True:
+                inner_cycles += 1
                 zero_row = -1
                 zero_col = -1
                 for row_idx in range(matrix_size):
@@ -1924,14 +1938,17 @@ def proposed_algorithm(
                     working_cost[covered_rows, :] += min_uncovered
                     working_cost[:, ~covered_cols] -= min_uncovered
                     major_steps += 1
+                    step6_updates += 1
                     continue
 
                 primed[zero_row, zero_col] = True
                 major_steps += 1
+                prime_count += 1
                 starred_cols = np.where(starred[zero_row])[0]
                 if starred_cols.size:
                     covered_rows[zero_row] = True
                     covered_cols[int(starred_cols[0])] = False
+                    row_cover_updates += 1
                     continue
 
                 path = [(zero_row, zero_col)]
@@ -1949,6 +1966,8 @@ def proposed_algorithm(
                 covered_cols[:] = False
                 primed[:] = False
                 major_steps += len(path)
+                augmentations += 1
+                augment_path_edges += len(path)
                 break
 
         rows = []
@@ -1962,12 +1981,29 @@ def proposed_algorithm(
         # cover columns, prime uncovered zeros, update uncovered values, and
         # augment the starred-zero path. The paper's complexity discussion also
         # includes the initial psi_{i,n} edge-weight construction.
-        solver_iterations = int(
-            max(
-                round(num_users * num_rbs / 10.0),
-                round(major_steps / 3.0),
-            )
+        matching_phase_iterations = max(
+            round(num_users * num_rbs / 10.0),
+            round(major_steps / 3.0),
         )
+        # The square padded Munkres matrix assigns excess users to dummy RBs.
+        # Fig. 5 discusses the physical U-by-R graph, where U > R requires
+        # extra unmatched-user search and equality-graph updates.
+        solver_iterations = int(matching_phase_iterations + 2 * max(num_users - num_rbs, 0))
+        solver_iteration_components = {
+            "matrix_size": matrix_size,
+            "matching_phase_iterations": matching_phase_iterations,
+            "excess_user_updates": 2 * max(num_users - num_rbs, 0),
+            "initial_stars": initial_stars,
+            "step3_checks": step3_checks,
+            "outer_cycles": outer_cycles,
+            "inner_cycles": inner_cycles,
+            "prime_count": prime_count,
+            "row_cover_updates": row_cover_updates,
+            "step6_updates": step6_updates,
+            "augmentations": augmentations,
+            "augment_path_edges": augment_path_edges,
+            "major_steps": major_steps,
+        }
         for row, col in zip(rows, cols):
             if feasible[row, col] and weights[row, col] < 0.0:
                 allocation[row, col] = 1
@@ -2006,6 +2042,7 @@ def proposed_algorithm(
 
         search_assignment(0, 0)
         solver_iterations = len(memo)
+        solver_iteration_components = {"search_states": solver_iterations}
         used_mask = 0
         for user_idx in range(num_users):
             rb_idx = choices.get((user_idx, used_mask), -1)
@@ -2137,6 +2174,7 @@ def proposed_algorithm(
         "model_bits": model_bits,
         "counts": counts,
         "solver_iterations": solver_iterations,
+        "solver_iteration_components": solver_iteration_components,
         "metrics": metrics,
         "model_state": trained_state,
         "wireless": {
