@@ -17,14 +17,88 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset, TensorDataset
 
 
-CACHED_DATA = {}
-SEED = 42
+class Context:
+    """One experiment environment shared by all comparison methods."""
+
+    def __init__(
+        self,
+        seed=None,
+        task=None,
+        partitions=None,
+        test_data=None,
+        counts=None,
+        num_users=None,
+        model_factory=None,
+        initial_model_state=None,
+        model_bits=None,
+        num_rbs=None,
+        distances=None,
+        channel_gain=None,
+        downlink_gain=None,
+        interference=None,
+        downlink_interference=None,
+        powers=None,
+        packet_errors=None,
+        uplink_rates=None,
+        downlink_rates=None,
+        total_delays=None,
+        energies=None,
+        feasible=None,
+        delay_s=None,
+        energy_j=None,
+        pmax_w=None,
+        rounds=None,
+        local_epochs=None,
+        learning_rate=None,
+        batch_size=None,
+        device=None,
+        loss=None,
+        optimizer_states=None,
+    ):
+        self.seed = seed
+        self.task = task
+
+        self.partitions = partitions
+        self.test_data = test_data
+        self.counts = counts
+        self.num_users = num_users
+
+        self.model_factory = model_factory
+        self.initial_model_state = initial_model_state
+        self.model_bits = model_bits
+
+        self.num_rbs = num_rbs
+        self.distances = distances
+        self.channel_gain = channel_gain
+        self.downlink_gain = downlink_gain
+        self.interference = interference
+        self.downlink_interference = downlink_interference
+        self.powers = powers
+        self.packet_errors = packet_errors
+        self.uplink_rates = uplink_rates
+        self.downlink_rates = downlink_rates
+        self.total_delays = total_delays
+        self.energies = energies
+        self.feasible = feasible
+
+        self.delay_s = delay_s
+        self.energy_j = energy_j
+        self.pmax_w = pmax_w
+
+        self.rounds = rounds
+        self.local_epochs = local_epochs
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.device = device
+        self.loss = loss
+        self.optimizer_states = optimizer_states
 
 
 # data processing
-def generate_synthetic_data(num_users=15, samples_per_user=30, seed=SEED, noise_std=0.4):
+def generate_synthetic_data(num_users=15, samples_per_user=30, seed=42, noise_std=0.4):
     """Generate the linear-regression data used in the paper: y=-2x+1+0.4N(0,1)."""
     rng = np.random.default_rng(seed)
+    # Accept either a scalar per-user count or an explicit Ki vector.
     if isinstance(samples_per_user, int):
         counts = [samples_per_user] * num_users
     else:
@@ -34,6 +108,7 @@ def generate_synthetic_data(num_users=15, samples_per_user=30, seed=SEED, noise_
     users = []
     all_x = []
     all_y = []
+    # Each user receives its own TensorDataset, matching the FL locality assumption.
     for count in counts:
         x = rng.random((int(count), 1), dtype=np.float32)
         y = -2.0 * x + 1.0 + noise_std * rng.standard_normal((int(count), 1)).astype(np.float32)
@@ -50,10 +125,11 @@ def generate_synthetic_data(num_users=15, samples_per_user=30, seed=SEED, noise_
     }
 
 
-def load_mnist_data(num_users=15, samples_per_user=200, test_samples=1000, seed=SEED, data_dir=None, download=False):
+def load_mnist_data(num_users=15, samples_per_user=200, test_samples=10000, seed=42, data_dir=None, download=False, train_order="shuffled", partition_order="shuffled"):
     """Load MNIST from a local npz/cache first, with torchvision download as an opt-in fallback."""
     rng = np.random.default_rng(seed)
     candidates = []
+    # Prefer user-provided/local caches because the reproduction should not depend on downloads.
     if data_dir is not None:
         data_path = Path(data_dir)
         candidates.append(data_path if data_path.suffix == ".npz" else data_path / "mnist.npz")
@@ -72,6 +148,7 @@ def load_mnist_data(num_users=15, samples_per_user=200, test_samples=1000, seed=
             break
 
     if arrays is None:
+        # Torchvision is used only when explicitly allowed to download or already cached.
         try:
             from torchvision import datasets, transforms
 
@@ -86,6 +163,7 @@ def load_mnist_data(num_users=15, samples_per_user=200, test_samples=1000, seed=
                 "y_test": test.targets.numpy(),
             }
         except Exception:
+            # Last-resort fallback keeps code runnable without MNIST, but it is not the paper dataset.
             from sklearn.datasets import load_digits
 
             digits = load_digits()
@@ -123,17 +201,36 @@ def load_mnist_data(num_users=15, samples_per_user=200, test_samples=1000, seed=
         else:
             counts = counts[:num_users]
     total_train = min(len(x_train), int(sum(counts)))
-    train_indices = rng.permutation(len(x_train))[:total_train]
+    train_order = str(train_order).lower()
+    if train_order == "shuffled":
+        train_indices = rng.permutation(len(x_train))[:total_train]
+    elif train_order == "file_order":
+        train_indices = np.arange(len(x_train))[:total_train]
+    else:
+        raise ValueError("train_order must be 'shuffled' or 'file_order'")
+    # Test data is sampled independently from user partitions.
     test_count = min(len(x_test), int(test_samples))
     test_indices = rng.permutation(len(x_test))[:test_count]
     train_data = TensorDataset(x_train[train_indices], y_train[train_indices])
     test_data = TensorDataset(x_test[test_indices], y_test[test_indices])
-    users = get_partitioned_data(train_data, num_users=num_users, samples_per_user=counts, seed=seed)
+    partition_order = str(partition_order).lower()
+    if partition_order not in {"shuffled", "file_order", "label_sorted"}:
+        raise ValueError("partition_order must be 'shuffled', 'file_order', or 'label_sorted'")
+    users = get_partitioned_data(
+        train_data,
+        num_users=num_users,
+        samples_per_user=counts,
+        seed=seed,
+        non_iid=partition_order == "label_sorted",
+        shuffle=partition_order == "shuffled",
+    )
+    # The return shape is shared by figure runners and FL algorithms.
     return {"train": train_data, "test": test_data, "users": users, "task": "mnist"}
 
 
-def get_partitioned_data(data=None, num_users=15, samples_per_user=None, seed=SEED, non_iid=False):
+def get_partitioned_data(data=None, num_users=15, samples_per_user=None, seed=42, non_iid=False, shuffle=True):
     """Partition a TensorDataset into user-local datasets for FL."""
+    # A missing dataset means the caller wants synthetic regression users.
     if data is None:
         return generate_synthetic_data(num_users=num_users, samples_per_user=samples_per_user or 30, seed=seed)["users"]
     if isinstance(data, dict) and "users" in data and samples_per_user is None:
@@ -151,13 +248,17 @@ def get_partitioned_data(data=None, num_users=15, samples_per_user=None, seed=SE
     else:
         counts = list(samples_per_user)
         num_users = len(counts)
+    # Clamp bad counts so every partition operation remains index-safe.
     counts = [max(0, min(int(count), dataset_len)) for count in counts]
 
     if non_iid and hasattr(data, "tensors") and len(data.tensors) > 1:
+        # Label sorting provides a simple non-IID partition option for sweeps.
         labels = data.tensors[1].detach().cpu().numpy()
         indices = np.argsort(labels)
-    else:
+    elif shuffle:
         indices = rng.permutation(dataset_len)
+    else:
+        indices = np.arange(dataset_len)
 
     users = []
     cursor = 0
@@ -165,6 +266,7 @@ def get_partitioned_data(data=None, num_users=15, samples_per_user=None, seed=SE
         selected = indices[cursor:cursor + count]
         cursor += count
         if len(selected) == 0:
+            # Empty local datasets break DataLoader and FedAvg weighting.
             selected = indices[:1]
         users.append(Subset(data, selected.tolist()))
     return users
@@ -174,6 +276,7 @@ def get_partitioned_data(data=None, num_users=15, samples_per_user=None, seed=SE
 class RegressionFNN(nn.Module):
     def __init__(self, hidden_size=20, activation="tanh"):
         super().__init__()
+        # The paper uses a 20-neuron FNN for linear regression.
         if activation == "tanh":
             nonlinear = nn.Tanh()
         elif activation == "relu":
@@ -191,9 +294,18 @@ class RegressionFNN(nn.Module):
 
 
 class MNISTFNN(nn.Module):
-    def __init__(self, hidden_size=50):
+    def __init__(self, hidden_size=50, activation="relu"):
         super().__init__()
-        self.net = nn.Sequential(nn.Flatten(), nn.Linear(28 * 28, hidden_size), nn.ReLU(), nn.Linear(hidden_size, 10))
+        # The paper uses a single hidden layer with 50 neurons for MNIST.
+        if activation == "relu":
+            nonlinear = nn.ReLU()
+        elif activation == "tanh":
+            nonlinear = nn.Tanh()
+        elif activation == "sigmoid":
+            nonlinear = nn.Sigmoid()
+        else:
+            raise ValueError("Unsupported MNIST activation")
+        self.net = nn.Sequential(nn.Flatten(), nn.Linear(28 * 28, hidden_size), nonlinear, nn.Linear(hidden_size, 10))
 
     def forward(self, x):
         return self.net(x)
@@ -202,6 +314,7 @@ class MNISTFNN(nn.Module):
 class MNISTCNN(nn.Module):
     def __init__(self):
         super().__init__()
+        # Fig. 10 uses CNNs to validate that the wireless-aware selection still helps.
         self.features = nn.Sequential(
             nn.Conv2d(1, 8, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -217,6 +330,321 @@ class MNISTCNN(nn.Module):
 
 
 # FL algorithms
+def fl_one_round(
+    context,
+    global_model,
+    selected_users,
+    assigned_rbs,
+    selected_errors,
+    rng,
+    round_index=0,
+    aggregation="fedavg",
+    verbose=False,
+    scheme=None,
+):
+    """Run one wireless-impaired local-training/FedAvg round for selected clients."""
+    train_cfg = context.loss["training"]
+    device_name = context.device or train_cfg["device"]
+    if device_name == "auto":
+        device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    device_obj = torch.device(device_name)
+    quantization_bits = int(train_cfg["quantization_bits"])
+    if quantization_bits == 16:
+        compute_dtype = torch.float16
+    elif quantization_bits == 32:
+        compute_dtype = torch.float32
+    elif quantization_bits == 64:
+        compute_dtype = torch.float64
+    else:
+        raise ValueError("training.quantization_bits supports actual compute dtype only for 16, 32, or 64 bits")
+    global_model = global_model.to(device_obj, dtype=compute_dtype)
+    loss_fn = nn.CrossEntropyLoss()
+    regression_loss = str(train_cfg["regression_loss"]).lower()
+    regression_scale_floor = float(train_cfg["regression_scale_floor"])
+    force_first_round_success = bool(train_cfg["force_first_round_success"])
+    optimizer_name = str(train_cfg.get("optimizer", "gradient_descent")).lower().replace("-", "_")
+    if optimizer_name in {"gd", "full_batch_gradient_descent"}:
+        optimizer_name = "gradient_descent"
+    if optimizer_name not in {"gradient_descent", "adam", "lbfgs"}:
+        raise ValueError("training.optimizer must be 'gradient_descent', 'adam', or 'lbfgs'")
+    learning_rate = float(
+        context.learning_rate
+        if context.learning_rate is not None
+        else (train_cfg["regression_lr"] if context.task == "regression" else train_cfg["mnist_lr"])
+    )
+    if optimizer_name == "adam":
+        adam_keys = ("adam_beta1", "adam_beta2", "adam_eps", "adam_weight_decay", "adam_persistent_state")
+        missing_adam_keys = [key for key in adam_keys if key not in train_cfg]
+        if missing_adam_keys:
+            raise ValueError("training.optimizer=adam requires explicit configs/*.yaml values for: " + ", ".join(missing_adam_keys))
+        adam_beta1 = float(train_cfg["adam_beta1"])
+        adam_beta2 = float(train_cfg["adam_beta2"])
+        adam_eps = float(train_cfg["adam_eps"])
+        adam_weight_decay = float(train_cfg["adam_weight_decay"])
+        adam_persistent_state = bool(train_cfg["adam_persistent_state"])
+        if adam_persistent_state and context.optimizer_states is None:
+            context.optimizer_states = {}
+    else:
+        adam_beta1 = None
+        adam_beta2 = None
+        adam_eps = None
+        adam_weight_decay = None
+        adam_persistent_state = False
+    if optimizer_name == "lbfgs":
+        lbfgs_keys = (
+            "lbfgs_max_iter",
+            "lbfgs_max_eval",
+            "lbfgs_tolerance_grad",
+            "lbfgs_tolerance_change",
+            "lbfgs_history_size",
+            "lbfgs_line_search_fn",
+        )
+        missing_lbfgs_keys = [key for key in lbfgs_keys if key not in train_cfg]
+        if missing_lbfgs_keys:
+            raise ValueError("training.optimizer=lbfgs requires explicit configs/*.yaml values for: " + ", ".join(missing_lbfgs_keys))
+        lbfgs_max_iter = int(train_cfg["lbfgs_max_iter"])
+        lbfgs_max_eval = int(train_cfg["lbfgs_max_eval"])
+        lbfgs_tolerance_grad = float(train_cfg["lbfgs_tolerance_grad"])
+        lbfgs_tolerance_change = float(train_cfg["lbfgs_tolerance_change"])
+        lbfgs_history_size = int(train_cfg["lbfgs_history_size"])
+        raw_line_search = train_cfg["lbfgs_line_search_fn"]
+        if raw_line_search is None:
+            lbfgs_line_search_fn = None
+        else:
+            lbfgs_line_search_fn = str(raw_line_search).lower()
+            if lbfgs_line_search_fn in {"none", "null"}:
+                lbfgs_line_search_fn = None
+            elif lbfgs_line_search_fn != "strong_wolfe":
+                raise ValueError("training.lbfgs_line_search_fn must be null or 'strong_wolfe'")
+    else:
+        lbfgs_max_iter = None
+        lbfgs_max_eval = None
+        lbfgs_tolerance_grad = None
+        lbfgs_tolerance_change = None
+        lbfgs_history_size = None
+        lbfgs_line_search_fn = None
+    local_epochs = int(context.local_epochs)
+    selected_users_array = np.asarray(selected_users, dtype=np.int64)
+    assigned_rbs_array = np.asarray(assigned_rbs, dtype=np.int64)
+    selected_errors_array = np.asarray(selected_errors, dtype=np.float64)
+    powers_matrix = np.asarray(context.powers) if context.powers is not None else None
+    rates_matrix = np.asarray(context.uplink_rates) if context.uplink_rates is not None else None
+    delays_matrix = np.asarray(context.total_delays) if context.total_delays is not None else None
+    energies_matrix = np.asarray(context.energies) if context.energies is not None else None
+    feasible_matrix = np.asarray(context.feasible) if context.feasible is not None else None
+    local_states = []
+    local_weights = []
+    successes = 0
+    verbose_print = None
+
+    if verbose:
+        raw_log_path = context.loss["_verbose_log_path"]
+        verbose_log_path = Path(raw_log_path)
+        verbose_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def verbose_print(message):
+            with open(verbose_log_path, "a", encoding="utf-8") as handle:
+                print(message, file=handle, flush=True)
+
+    if verbose:
+        scheme_label = scheme or "fl"
+        expected_successes = float(np.sum(1.0 - selected_errors_array)) if selected_errors_array.size else 0.0
+        verbose_print(
+            f"[fl_one_round][{scheme_label}] round={round_index + 1} task={context.task} "
+            f"device={device_obj} dtype={compute_dtype} optimizer={optimizer_name} lr={learning_rate:.6g} local_epochs={local_epochs} "
+            f"aggregation={aggregation} selected={len(selected_users_array)} "
+            f"expected_successes={expected_successes:.6g}"
+        )
+        if optimizer_name == "adam":
+            verbose_print(
+                f"[fl_one_round][{scheme_label}] adam_beta1={adam_beta1:.6g} "
+                f"adam_beta2={adam_beta2:.6g} adam_eps={adam_eps:.6g} "
+                f"adam_weight_decay={adam_weight_decay:.6g} "
+                f"adam_persistent_state={adam_persistent_state}"
+            )
+        if optimizer_name == "lbfgs":
+            verbose_print(
+                f"[fl_one_round][{scheme_label}] lbfgs_max_iter={lbfgs_max_iter} "
+                f"lbfgs_max_eval={lbfgs_max_eval} lbfgs_tolerance_grad={lbfgs_tolerance_grad:.6g} "
+                f"lbfgs_tolerance_change={lbfgs_tolerance_change:.6g} "
+                f"lbfgs_history_size={lbfgs_history_size} lbfgs_line_search_fn={lbfgs_line_search_fn}"
+            )
+        if selected_users_array.size:
+            verbose_print(
+                f"[fl_one_round][{scheme_label}] selected_users={selected_users_array.tolist()} "
+                f"assigned_rbs={assigned_rbs_array.tolist()} "
+                f"packet_errors={np.round(selected_errors_array, 6).tolist()}"
+            )
+
+    global_state_before = None
+    if verbose:
+        global_state_before = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
+
+    for user_idx, rb_idx, packet_error in zip(selected_users_array, assigned_rbs_array, selected_errors_array):
+        local_model = copy.deepcopy(global_model).to(device_obj, dtype=compute_dtype)
+        local_model.train()
+        if optimizer_name == "adam":
+            optimizer = torch.optim.Adam(
+                local_model.parameters(),
+                lr=learning_rate,
+                betas=(adam_beta1, adam_beta2),
+                eps=adam_eps,
+                weight_decay=adam_weight_decay,
+            )
+            if adam_persistent_state and int(user_idx) in context.optimizer_states:
+                optimizer.load_state_dict(context.optimizer_states[int(user_idx)])
+        elif optimizer_name == "lbfgs":
+            optimizer = torch.optim.LBFGS(
+                local_model.parameters(),
+                lr=learning_rate,
+                max_iter=lbfgs_max_iter,
+                max_eval=lbfgs_max_eval,
+                tolerance_grad=lbfgs_tolerance_grad,
+                tolerance_change=lbfgs_tolerance_change,
+                history_size=lbfgs_history_size,
+                line_search_fn=lbfgs_line_search_fn,
+            )
+        else:
+            optimizer = None
+        user_data = context.partitions[int(user_idx)]
+        loader = DataLoader(user_data, batch_size=len(user_data), shuffle=False)
+        local_state_before = None
+        if verbose:
+            power = powers_matrix[int(user_idx), int(rb_idx)] if powers_matrix is not None else None
+            rate = rates_matrix[int(user_idx), int(rb_idx)] if rates_matrix is not None else None
+            delay = delays_matrix[int(user_idx), int(rb_idx)] if delays_matrix is not None else None
+            energy = energies_matrix[int(user_idx), int(rb_idx)] if energies_matrix is not None else None
+            feasible = bool(feasible_matrix[int(user_idx), int(rb_idx)]) if feasible_matrix is not None else None
+            count_value = context.counts[int(user_idx)] if context.counts is not None else len(user_data)
+            power_text = "n/a" if power is None else f"{float(power):.6g}"
+            rate_text = "n/a" if rate is None else f"{float(rate):.6g}"
+            delay_text = "n/a" if delay is None else f"{float(delay):.6g}"
+            energy_text = "n/a" if energy is None else f"{float(energy):.6g}"
+            feasible_text = "n/a" if feasible is None else str(feasible)
+            verbose_print(
+                f"[fl_one_round][{scheme_label}] user={int(user_idx)} rb={int(rb_idx)} "
+                f"samples={len(user_data)} count={float(count_value):.6g} "
+                f"packet_error={float(packet_error):.6g} "
+                f"power_w={power_text} "
+                f"uplink_rate_bps={rate_text} "
+                f"total_delay_s={delay_text} "
+                f"energy_j={energy_text} "
+                f"feasible={feasible_text}"
+            )
+            local_state_before = {name: value.detach().cpu().clone() for name, value in local_model.state_dict().items()}
+
+        for local_epoch in range(local_epochs):
+            for batch_index, (features, labels) in enumerate(loader):
+                features = features.to(device_obj, dtype=compute_dtype)
+                labels = labels.to(device_obj)
+
+                def local_loss():
+                    prediction = local_model(features)
+                    if context.task == "regression":
+                        target = labels.to(device_obj, dtype=compute_dtype).reshape_as(prediction)
+                        error = prediction - target
+                        if regression_loss == "nmse":
+                            target_range = (target.max() - target.min()).clamp_min(regression_scale_floor)
+                            return (2.0 * error / target_range).pow(2).mean()
+                        return error.pow(2).mean()
+                    return loss_fn(prediction, labels.long())
+
+                if optimizer_name == "lbfgs":
+                    def closure():
+                        optimizer.zero_grad(set_to_none=True)
+                        closure_loss = local_loss()
+                        closure_loss.backward()
+                        return closure_loss
+
+                    loss = optimizer.step(closure)
+                else:
+                    if optimizer is None:
+                        local_model.zero_grad(set_to_none=True)
+                    else:
+                        optimizer.zero_grad(set_to_none=True)
+                    loss = local_loss()
+                    loss.backward()
+                grad_norm_sq = 0.0
+                for parameter in local_model.parameters():
+                    if parameter.grad is not None and verbose:
+                        grad_norm_sq += float(parameter.grad.detach().pow(2).sum().item())
+                if optimizer is None:
+                    with torch.no_grad():
+                        for parameter in local_model.parameters():
+                            if parameter.grad is not None:
+                                parameter.add_(parameter.grad, alpha=-learning_rate)
+                elif optimizer_name == "adam":
+                    optimizer.step()
+                if verbose:
+                    grad_norm = math.sqrt(grad_norm_sq)
+                    verbose_print(
+                        f"[fl_one_round][{scheme_label}] user={int(user_idx)} "
+                        f"epoch={local_epoch + 1}/{local_epochs} batch={batch_index + 1} "
+                        f"batch_samples={len(features)} local_loss={float(loss.item()):.9g} "
+                        f"grad_norm={grad_norm:.9g}"
+                    )
+        if verbose and local_state_before is not None:
+            local_state_after = {name: value.detach().cpu() for name, value in local_model.state_dict().items()}
+            delta_norm_sq = sum(
+                float((local_state_after[name] - local_state_before[name]).pow(2).sum().item())
+                for name in local_state_before
+            )
+            verbose_print(f"[fl_one_round][{scheme_label}] user={int(user_idx)} local_delta_norm={math.sqrt(delta_norm_sq):.9g}")
+
+        if optimizer_name == "adam" and adam_persistent_state:
+            state_dict = optimizer.state_dict()
+            cpu_state = {"state": {}, "param_groups": copy.deepcopy(state_dict["param_groups"])}
+            for state_key, state_value in state_dict["state"].items():
+                cpu_state["state"][state_key] = {}
+                for item_key, item_value in state_value.items():
+                    if torch.is_tensor(item_value):
+                        cpu_state["state"][state_key][item_key] = item_value.detach().cpu().clone()
+                    else:
+                        cpu_state["state"][state_key][item_key] = copy.deepcopy(item_value)
+            context.optimizer_states[int(user_idx)] = cpu_state
+
+        forced_success = force_first_round_success and round_index == 0 and packet_error < 1.0
+        packet_draw = None if forced_success else float(rng.random())
+        packet_success = forced_success or packet_draw > packet_error
+        if verbose:
+            reason = "forced_first_round_success" if forced_success else "crc_success" if packet_success else "crc_drop"
+            draw_text = "n/a" if packet_draw is None else f"{packet_draw:.9g}"
+            verbose_print(
+                f"[fl_one_round][{scheme_label}] user={int(user_idx)} packet_draw={draw_text} "
+                f"packet_error={float(packet_error):.9g} accepted={packet_success} reason={reason}"
+            )
+        if packet_success:
+            local_states.append({name: value.detach().cpu() for name, value in local_model.state_dict().items()})
+            if aggregation == "fedavg":
+                local_weights.append(float(len(context.partitions[int(user_idx)])))
+            elif aggregation == "uniform":
+                local_weights.append(1.0)
+            else:
+                raise ValueError(f"Unsupported aggregation: {aggregation}")
+            successes += 1
+
+    if local_states:
+        total_weight = sum(local_weights)
+        averaged = {}
+        for name in local_states[0]:
+            averaged[name] = sum(state[name] * (weight / total_weight) for state, weight in zip(local_states, local_weights))
+        global_model.load_state_dict(averaged)
+        if verbose:
+            global_state_after = {name: value.detach().cpu() for name, value in global_model.state_dict().items()}
+            global_delta_norm_sq = sum(
+                float((global_state_after[name] - global_state_before[name]).pow(2).sum().item())
+                for name in global_state_before
+            )
+            verbose_print(
+                f"[fl_one_round][{scheme_label}] aggregated_successes={successes} "
+                f"weight_sum={total_weight:.6g} weights={np.round(np.asarray(local_weights), 6).tolist()} "
+                f"global_delta_norm={math.sqrt(global_delta_norm_sq):.9g}"
+            )
+    elif verbose:
+        verbose_print(f"[fl_one_round][{scheme_label}] aggregated_successes=0 no_global_update=True")
+    return successes
+
+
 def baseline_a(
     partitions=None,
     model=None,
@@ -232,69 +660,121 @@ def baseline_a(
     device=None,
     learning_rate=None,
     model_bits=None,
+    verbose=False,
 ):
-    """Baseline a): FL-aware user selection with random RB allocation."""
-    cfg = load_yaml() if config is None else config
+    """Baseline a): FL-aware user selection with random RB allocation and full-batch GD local updates."""
+    context = partitions if isinstance(partitions, Context) else None
+    cfg = context.loss if context is not None else (build_contexts()[0].loss if config is None else config)
     wireless = cfg["wireless"]
     train_cfg = cfg["training"]
-    seed = int(cfg["seed"] if seed is None else seed)
+    verbose = bool(verbose or cfg["_verbose"])
+    if context is not None:
+        partitions = context.partitions
+        test_data = context.test_data
+        num_users = context.num_users
+        num_rbs = context.num_rbs
+        rounds = context.rounds
+        local_epochs = context.local_epochs
+        batch_size = context.batch_size
+        learning_rate = context.learning_rate
+        device = context.device
+        model_bits = context.model_bits
+        seed = context.seed
+        task = context.task
+        model = context.model_factory()
+        model.load_state_dict(copy.deepcopy(context.initial_model_state))
+    if context is not None:
+        seed = int(seed)
+    else:
+        seed_value = cfg["seed"] if seed is None else seed
+        if isinstance(seed_value, list):
+            if not seed_value:
+                raise ValueError("seed list must not be empty")
+            seed_value = seed_value[0]
+        seed = int(seed_value)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
-    regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
-    min_distance = float(wireless.get("min_distance_m", 5.0))
-    interference_sigma = float(wireless.get("interference_lognormal_sigma", 0.35))
-    rate_floor = float(wireless.get("rate_floor", 1e-12))
-    channel_gain_floor = float(wireless.get("channel_gain_floor", 1e-18))
-    snr_denominator_floor = float(wireless.get("snr_denominator_floor", 1e-18))
-    power_floor = float(wireless.get("power_floor_w", 1e-12))
-    power_solver_maxiter = int(wireless.get("power_solver_maxiter", 50))
+    eval_batch_size = int(train_cfg["eval_batch_size"])
+    regression_scale_floor = float(train_cfg["regression_scale_floor"])
+    min_distance = float(wireless["min_distance_m"])
+    interference_sigma = float(wireless["interference_lognormal_sigma"])
+    rate_floor = float(wireless["rate_floor"])
+    # Numerical floors prevent invalid rates or packet-error divisions at d=0.
+    channel_gain_floor = float(wireless["channel_gain_floor"])
+    snr_denominator_floor = float(wireless["snr_denominator_floor"])
+    power_floor = float(wireless["power_floor_w"])
+    power_solver_maxiter = int(wireless["power_solver_maxiter"])
 
-    if partitions is not None:
+    if context is None and partitions is not None:
         num_users = len(partitions)
-    counts = np.array(
-        [
-            len(partitions[i]) if partitions is not None else wireless["ki_cycle"][i % len(wireless["ki_cycle"])]
-            for i in range(num_users)
-        ],
-        dtype=np.float64,
-    )
-    counts = np.maximum(counts, 1.0)
+    if context is not None:
+        counts = np.asarray(context.counts, dtype=np.float64)
+    else:
+        counts = np.array(
+            [
+                len(partitions[i]) if partitions is not None else wireless["ki_cycle"][i % len(wireless["ki_cycle"])]
+                for i in range(num_users)
+            ],
+            dtype=np.float64,
+        )
+    # Counts are Ki values in the paper and weight the FL-aware assignment objective.
+    if context is None:
+        counts = np.maximum(counts, 1.0)
 
+    mnist_activation = str(train_cfg["mnist_activation"]).lower()
     if model is None:
-        model = RegressionFNN() if task == "regression" else MNISTFNN()
+        model = RegressionFNN() if task == "regression" else MNISTFNN(activation=mnist_activation)
     if isinstance(model, type):
-        model = model()
+        model = model(activation=mnist_activation) if model is MNISTFNN else model()
     if model_bits is None:
-        quantization_bits = train_cfg.get("quantization_bits")
+        quantization_bits = train_cfg["quantization_bits"]
         if quantization_bits is None:
             model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
         else:
             model_bits = int(sum(parameter.numel() for parameter in model.parameters()) * int(quantization_bits))
 
-    radius = float(wireless["radius_m"])
-    distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
-    fading = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs))
-    channel_gain = fading * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
-    downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
+    # Draw one wireless geometry for this scheme run, unless a shared Context provides it.
+    if context is not None:
+        distances = np.asarray(context.distances, dtype=np.float64)
+        channel_gain = np.asarray(context.channel_gain, dtype=np.float64)
+        downlink_gain = np.asarray(context.downlink_gain, dtype=np.float64)
+    else:
+        radius = float(wireless["radius_m"])
+        distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
+        channel_model = str(wireless["channel_model"]).lower()
+        if channel_model == "mean":
+            channel_gain = float(wireless["rayleigh_mean"]) * np.ones((num_users, num_rbs), dtype=np.float64) * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+            downlink_gain = float(wireless["rayleigh_mean"]) * distances ** (-float(wireless["path_loss_alpha"]))
+        elif channel_model == "rayleigh":
+            channel_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs)) * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+            downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
+        else:
+            raise ValueError("wireless.channel_model must be 'mean' or 'rayleigh'")
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference_by_rbs = wireless.get("interference_w_by_rbs", {})
-    interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
-    if interference_profile is None and isinstance(interference_by_rbs, dict):
-        interference_profile = interference_by_rbs.get(num_rbs)
-    if interference_profile is not None:
-        interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
-        if interference.size != num_rbs:
-            raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
+    if context is not None:
+        interference = np.maximum(np.asarray(context.interference, dtype=np.float64), 0.0)
     else:
-        interference_w = float(wireless["interference_w"])
-        if interference_w <= 0.0:
-            interference = np.zeros(num_rbs, dtype=np.float64)
+        interference_by_rbs = wireless["interference_w_by_rbs"]
+        interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
+        if interference_profile is None and isinstance(interference_by_rbs, dict):
+            interference_profile = interference_by_rbs.get(num_rbs)
+        if interference_profile is not None:
+            interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
+            if interference.size != num_rbs:
+                raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
         else:
-            interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
-    downlink_interference = float(wireless["downlink_interference_w"])
+            # Lognormal interference is a sweepable assumption outside the paper.
+            interference_w = float(wireless["interference_w"])
+            if interference_w <= 0.0:
+                interference = np.zeros(num_rbs, dtype=np.float64)
+            else:
+                interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
+    if context is not None:
+        downlink_interference = float(context.downlink_interference)
+    else:
+        downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
     gamma_t = float(wireless["delay_s"])
@@ -313,20 +793,24 @@ def baseline_a(
     feasible = np.zeros((num_users, num_rbs), dtype=bool)
     model_megabits = model_bits / (1024.0 * 1024.0)
     train_energy = zeta * omega * cpu ** 2 * model_megabits
+    # Downlink is broadcast-like in the paper, but per-user delay still depends on distance.
     downlink_rates = downlink_bandwidth * np.log2(
         1.0 + bs_power * downlink_gain / (downlink_interference + downlink_bandwidth * n0_w_hz)
     )
     downlink_delays = model_bits / np.maximum(downlink_rates, rate_floor)
 
+    # Build the U x R link matrix: optimal power, rate, PER, delay, energy.
     for user_idx in range(num_users):
         for rb_idx in range(num_rbs):
             gain = max(channel_gain[user_idx, rb_idx], channel_gain_floor)
             noise_plus_interference = interference[rb_idx] + uplink_bandwidth * n0_w_hz
 
             def energy_at(power):
+                # Equation (10): local training energy plus uplink transmit energy.
                 rate_value = uplink_bandwidth * math.log2(1.0 + power * gain / noise_plus_interference)
                 return train_energy + power * model_bits / max(rate_value, rate_floor)
 
+            # Proposition 2: use the largest feasible transmit power.
             if train_energy >= gamma_e:
                 power = min(pmax, power_floor)
             elif energy_at(pmax) <= gamma_e:
@@ -344,6 +828,7 @@ def baseline_a(
             delay = model_bits / max(rate, rate_floor)
             energy = energy_at(power)
 
+            # Feasible edges satisfy both paper constraints (11c) and (11d).
             powers[user_idx, rb_idx] = power
             packet_errors[user_idx, rb_idx] = packet_error
             uplink_rates[user_idx, rb_idx] = rate
@@ -352,6 +837,7 @@ def baseline_a(
             energies[user_idx, rb_idx] = energy
             feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
 
+    # Baseline a keeps the FL-aware user set, then randomizes RB assignment.
     weights = np.where(feasible, counts[:, None] * (packet_errors - 1.0), 0.0)
     assignment_users = []
     rows, cols = linear_sum_assignment(weights)
@@ -382,6 +868,7 @@ def baseline_a(
     metrics = {"loss": [], "accuracy": [], "successful_users": []}
     trained_state = None
     if rounds > 0 and partitions is not None:
+        # The wireless assignment is fixed during the FL training process.
         device_name = device or train_cfg["device"]
         if device_name == "auto":
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
@@ -389,51 +876,53 @@ def baseline_a(
         global_model = model.to(device_obj)
         loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
-        regression_loss = str(train_cfg.get("regression_loss", "mse")).lower()
+        regression_loss = str(train_cfg["regression_loss"]).lower()
         if regression_loss not in {"mse", "nmse"}:
             raise ValueError("training.regression_loss must be 'mse' or 'nmse'")
+        round_context = Context(
+            seed=seed,
+            task=task,
+            partitions=partitions,
+            test_data=test_data,
+            counts=counts,
+            num_users=num_users,
+            model_bits=model_bits,
+            num_rbs=num_rbs,
+            powers=powers,
+            packet_errors=packet_errors,
+            uplink_rates=uplink_rates,
+            downlink_rates=downlink_rates,
+            total_delays=total_delays,
+            energies=energies,
+            feasible=feasible,
+            delay_s=gamma_t,
+            energy_j=gamma_e,
+            pmax_w=pmax,
+            rounds=rounds,
+            local_epochs=local_epochs,
+            learning_rate=lr,
+            batch_size=batch_size,
+            device=device_name,
+            loss=cfg,
+        )
 
-        for _ in range(int(rounds)):
-            local_states = []
-            local_weights = []
-            successes = 0
-            for user_idx, rb_idx, packet_error in zip(selected_users, assigned_rbs, selected_errors):
-                local_model = copy.deepcopy(global_model).to(device_obj)
-                local_model.train()
-                optimizer = torch.optim.SGD(local_model.parameters(), lr=lr)
-                loader = DataLoader(partitions[int(user_idx)], batch_size=min(batch_size, len(partitions[int(user_idx)])), shuffle=True)
-                for _local_epoch in range(int(local_epochs)):
-                    for features, labels in loader:
-                        features = features.to(device_obj)
-                        labels = labels.to(device_obj)
-                        optimizer.zero_grad()
-                        prediction = local_model(features)
-                        if task == "regression":
-                            target = labels.float().reshape_as(prediction)
-                            error = prediction - target
-                            squared_error = error.pow(2)
-                            if regression_loss == "nmse":
-                                target_range = (target.max() - target.min()).clamp_min(regression_scale_floor)
-                                loss = (2.0 * error / target_range).pow(2).mean()
-                            else:
-                                loss = squared_error.mean()
-                        else:
-                            loss = loss_fn(prediction, labels.long())
-                        loss.backward()
-                        optimizer.step()
-                if rng.random() > packet_error:
-                    local_states.append({name: value.detach().cpu() for name, value in local_model.state_dict().items()})
-                    local_weights.append(float(len(partitions[int(user_idx)])))
-                    successes += 1
-
-            if local_states:
-                total_weight = sum(local_weights)
-                averaged = {}
-                for name in local_states[0]:
-                    averaged[name] = sum(state[name] * (weight / total_weight) for state, weight in zip(local_states, local_weights))
-                global_model.load_state_dict(averaged)
+        for round_index in range(int(rounds)):
+            # At each round, successful local packets are aggregated by FedAvg.
+            successes = fl_one_round(
+                round_context,
+                global_model,
+                selected_users,
+                assigned_rbs,
+                selected_errors,
+                rng,
+                round_index=round_index,
+                aggregation="fedavg",
+                verbose=verbose,
+                scheme="baseline_a",
+            )
 
             global_model.eval()
+            # Evaluate the current global model after each communication round.
             eval_loss = 0.0
             eval_target_min = float("inf")
             eval_target_max = float("-inf")
@@ -451,11 +940,11 @@ def baseline_a(
             loader = DataLoader(eval_source, batch_size=eval_batch_size, shuffle=False)
             with torch.no_grad():
                 for features, labels in loader:
-                    features = features.to(device_obj)
+                    features = features.to(device_obj, dtype=next(global_model.parameters()).dtype)
                     labels = labels.to(device_obj)
                     prediction = global_model(features)
                     if task == "regression":
-                        target = labels.float().reshape_as(prediction)
+                        target = labels.to(device_obj, dtype=prediction.dtype).reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
                         eval_target_min = min(eval_target_min, float(target.min().item()))
                         eval_target_max = max(eval_target_max, float(target.max().item()))
@@ -516,69 +1005,119 @@ def baseline_b(
     device=None,
     learning_rate=None,
     model_bits=None,
+    verbose=False,
 ):
-    """Baseline b): random user selection and random RB allocation."""
-    cfg = load_yaml() if config is None else config
+    """Baseline b): random user selection and random RB allocation with full-batch GD local updates."""
+    # This baseline reuses the same wireless channel model but ignores FL-aware selection.
+    context = partitions if isinstance(partitions, Context) else None
+    cfg = context.loss if context is not None else (build_contexts()[0].loss if config is None else config)
     wireless = cfg["wireless"]
     train_cfg = cfg["training"]
-    seed = int(cfg["seed"] if seed is None else seed)
+    verbose = bool(verbose or cfg["_verbose"])
+    if context is not None:
+        partitions = context.partitions
+        test_data = context.test_data
+        num_users = context.num_users
+        num_rbs = context.num_rbs
+        rounds = context.rounds
+        local_epochs = context.local_epochs
+        batch_size = context.batch_size
+        learning_rate = context.learning_rate
+        device = context.device
+        model_bits = context.model_bits
+        seed = context.seed
+        task = context.task
+        model = context.model_factory()
+        model.load_state_dict(copy.deepcopy(context.initial_model_state))
+    if context is not None:
+        seed = int(seed)
+    else:
+        seed_value = cfg["seed"] if seed is None else seed
+        if isinstance(seed_value, list):
+            if not seed_value:
+                raise ValueError("seed list must not be empty")
+            seed_value = seed_value[0]
+        seed = int(seed_value)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
-    regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
-    min_distance = float(wireless.get("min_distance_m", 5.0))
-    interference_sigma = float(wireless.get("interference_lognormal_sigma", 0.35))
-    rate_floor = float(wireless.get("rate_floor", 1e-12))
-    channel_gain_floor = float(wireless.get("channel_gain_floor", 1e-18))
-    snr_denominator_floor = float(wireless.get("snr_denominator_floor", 1e-18))
-    power_floor = float(wireless.get("power_floor_w", 1e-12))
-    power_solver_maxiter = int(wireless.get("power_solver_maxiter", 50))
+    eval_batch_size = int(train_cfg["eval_batch_size"])
+    regression_scale_floor = float(train_cfg["regression_scale_floor"])
+    min_distance = float(wireless["min_distance_m"])
+    interference_sigma = float(wireless["interference_lognormal_sigma"])
+    rate_floor = float(wireless["rate_floor"])
+    channel_gain_floor = float(wireless["channel_gain_floor"])
+    snr_denominator_floor = float(wireless["snr_denominator_floor"])
+    power_floor = float(wireless["power_floor_w"])
+    power_solver_maxiter = int(wireless["power_solver_maxiter"])
 
-    if partitions is not None:
+    if context is None and partitions is not None:
         num_users = len(partitions)
-    counts = np.array(
-        [
-            len(partitions[i]) if partitions is not None else wireless["ki_cycle"][i % len(wireless["ki_cycle"])]
-            for i in range(num_users)
-        ],
-        dtype=np.float64,
-    )
-    counts = np.maximum(counts, 1.0)
+    if context is not None:
+        counts = np.asarray(context.counts, dtype=np.float64)
+    else:
+        counts = np.array(
+            [
+                len(partitions[i]) if partitions is not None else wireless["ki_cycle"][i % len(wireless["ki_cycle"])]
+                for i in range(num_users)
+            ],
+            dtype=np.float64,
+        )
+    if context is None:
+        counts = np.maximum(counts, 1.0)
 
+    mnist_activation = str(train_cfg["mnist_activation"]).lower()
     if model is None:
-        model = RegressionFNN() if task == "regression" else MNISTFNN()
+        model = RegressionFNN() if task == "regression" else MNISTFNN(activation=mnist_activation)
     if isinstance(model, type):
-        model = model()
+        model = model(activation=mnist_activation) if model is MNISTFNN else model()
     if model_bits is None:
-        quantization_bits = train_cfg.get("quantization_bits")
+        quantization_bits = train_cfg["quantization_bits"]
         if quantization_bits is None:
             model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
         else:
             model_bits = int(sum(parameter.numel() for parameter in model.parameters()) * int(quantization_bits))
 
-    radius = float(wireless["radius_m"])
-    distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
-    fading = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs))
-    channel_gain = fading * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
-    downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
+    # Generate the same link matrices as the proposed method before random assignment.
+    if context is not None:
+        distances = np.asarray(context.distances, dtype=np.float64)
+        channel_gain = np.asarray(context.channel_gain, dtype=np.float64)
+        downlink_gain = np.asarray(context.downlink_gain, dtype=np.float64)
+    else:
+        radius = float(wireless["radius_m"])
+        distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
+        channel_model = str(wireless["channel_model"]).lower()
+        if channel_model == "mean":
+            channel_gain = float(wireless["rayleigh_mean"]) * np.ones((num_users, num_rbs), dtype=np.float64) * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+            downlink_gain = float(wireless["rayleigh_mean"]) * distances ** (-float(wireless["path_loss_alpha"]))
+        elif channel_model == "rayleigh":
+            channel_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs)) * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+            downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
+        else:
+            raise ValueError("wireless.channel_model must be 'mean' or 'rayleigh'")
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference_by_rbs = wireless.get("interference_w_by_rbs", {})
-    interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
-    if interference_profile is None and isinstance(interference_by_rbs, dict):
-        interference_profile = interference_by_rbs.get(num_rbs)
-    if interference_profile is not None:
-        interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
-        if interference.size != num_rbs:
-            raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
+    if context is not None:
+        interference = np.maximum(np.asarray(context.interference, dtype=np.float64), 0.0)
     else:
-        interference_w = float(wireless["interference_w"])
-        if interference_w <= 0.0:
-            interference = np.zeros(num_rbs, dtype=np.float64)
+        interference_by_rbs = wireless["interference_w_by_rbs"]
+        interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
+        if interference_profile is None and isinstance(interference_by_rbs, dict):
+            interference_profile = interference_by_rbs.get(num_rbs)
+        if interference_profile is not None:
+            interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
+            if interference.size != num_rbs:
+                raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
         else:
-            interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
-    downlink_interference = float(wireless["downlink_interference_w"])
+            interference_w = float(wireless["interference_w"])
+            if interference_w <= 0.0:
+                interference = np.zeros(num_rbs, dtype=np.float64)
+            else:
+                interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
+    if context is not None:
+        downlink_interference = float(context.downlink_interference)
+    else:
+        downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
     gamma_t = float(wireless["delay_s"])
@@ -602,6 +1141,7 @@ def baseline_b(
     )
     downlink_delays = model_bits / np.maximum(downlink_rates, rate_floor)
 
+    # Even random assignments must still be checked against delay and energy limits.
     for user_idx in range(num_users):
         for rb_idx in range(num_rbs):
             gain = max(channel_gain[user_idx, rb_idx], channel_gain_floor)
@@ -636,6 +1176,7 @@ def baseline_b(
             energies[user_idx, rb_idx] = energy
             feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
 
+    # Baseline b follows standard FL-style random participant and RB selection.
     if num_rbs < num_users:
         selected_users = rng.choice(num_users, size=num_rbs, replace=False).astype(np.int64)
     else:
@@ -659,6 +1200,7 @@ def baseline_b(
     metrics = {"loss": [], "accuracy": [], "successful_users": []}
     trained_state = None
     if rounds > 0 and partitions is not None:
+        # Training is identical to proposed FL once the random wireless assignment is fixed.
         device_name = device or train_cfg["device"]
         if device_name == "auto":
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
@@ -666,49 +1208,49 @@ def baseline_b(
         global_model = model.to(device_obj)
         loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
-        regression_loss = str(train_cfg.get("regression_loss", "mse")).lower()
+        regression_loss = str(train_cfg["regression_loss"]).lower()
         if regression_loss not in {"mse", "nmse"}:
             raise ValueError("training.regression_loss must be 'mse' or 'nmse'")
+        round_context = Context(
+            seed=seed,
+            task=task,
+            partitions=partitions,
+            test_data=test_data,
+            counts=counts,
+            num_users=num_users,
+            model_bits=model_bits,
+            num_rbs=num_rbs,
+            powers=powers,
+            packet_errors=packet_errors,
+            uplink_rates=uplink_rates,
+            downlink_rates=downlink_rates,
+            total_delays=total_delays,
+            energies=energies,
+            feasible=feasible,
+            delay_s=gamma_t,
+            energy_j=gamma_e,
+            pmax_w=pmax,
+            rounds=rounds,
+            local_epochs=local_epochs,
+            learning_rate=lr,
+            batch_size=batch_size,
+            device=device_name,
+            loss=cfg,
+        )
 
-        for _ in range(int(rounds)):
-            local_states = []
-            local_weights = []
-            successes = 0
-            for user_idx, rb_idx, packet_error in zip(selected_users, assigned_rbs, selected_errors):
-                local_model = copy.deepcopy(global_model).to(device_obj)
-                local_model.train()
-                optimizer = torch.optim.SGD(local_model.parameters(), lr=lr)
-                loader = DataLoader(partitions[int(user_idx)], batch_size=min(batch_size, len(partitions[int(user_idx)])), shuffle=True)
-                for _local_epoch in range(int(local_epochs)):
-                    for features, labels in loader:
-                        features = features.to(device_obj)
-                        labels = labels.to(device_obj)
-                        optimizer.zero_grad()
-                        prediction = local_model(features)
-                        if task == "regression":
-                            target = labels.float().reshape_as(prediction)
-                            error = prediction - target
-                            squared_error = error.pow(2)
-                            if regression_loss == "nmse":
-                                target_range = (target.max() - target.min()).clamp_min(regression_scale_floor)
-                                loss = (2.0 * error / target_range).pow(2).mean()
-                            else:
-                                loss = squared_error.mean()
-                        else:
-                            loss = loss_fn(prediction, labels.long())
-                        loss.backward()
-                        optimizer.step()
-                if rng.random() > packet_error:
-                    local_states.append({name: value.detach().cpu() for name, value in local_model.state_dict().items()})
-                    local_weights.append(float(len(partitions[int(user_idx)])))
-                    successes += 1
-
-            if local_states:
-                total_weight = sum(local_weights)
-                averaged = {}
-                for name in local_states[0]:
-                    averaged[name] = sum(state[name] * (weight / total_weight) for state, weight in zip(local_states, local_weights))
-                global_model.load_state_dict(averaged)
+        for round_index in range(int(rounds)):
+            successes = fl_one_round(
+                round_context,
+                global_model,
+                selected_users,
+                assigned_rbs,
+                selected_errors,
+                rng,
+                round_index=round_index,
+                aggregation="fedavg",
+                verbose=verbose,
+                scheme="baseline_b",
+            )
 
             global_model.eval()
             eval_loss = 0.0
@@ -728,11 +1270,11 @@ def baseline_b(
             loader = DataLoader(eval_source, batch_size=eval_batch_size, shuffle=False)
             with torch.no_grad():
                 for features, labels in loader:
-                    features = features.to(device_obj)
+                    features = features.to(device_obj, dtype=next(global_model.parameters()).dtype)
                     labels = labels.to(device_obj)
                     prediction = global_model(features)
                     if task == "regression":
-                        target = labels.float().reshape_as(prediction)
+                        target = labels.to(device_obj, dtype=prediction.dtype).reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
                         eval_target_min = min(eval_target_min, float(target.min().item()))
                         eval_target_max = max(eval_target_max, float(target.max().item()))
@@ -793,69 +1335,124 @@ def baseline_c(
     device=None,
     learning_rate=None,
     model_bits=None,
+    verbose=False,
 ):
-    """Baseline c): wireless-only optimization that ignores FL parameters."""
-    cfg = load_yaml() if config is None else config
+    """Baseline c): wireless-only optimization that ignores FL parameters, with full-batch GD local updates."""
+    # Baseline c optimizes wireless packet reliability without Ki weighting.
+    context = partitions if isinstance(partitions, Context) else None
+    cfg = context.loss if context is not None else (build_contexts()[0].loss if config is None else config)
     wireless = cfg["wireless"]
     train_cfg = cfg["training"]
-    seed = int(cfg["seed"] if seed is None else seed)
+    baseline_c_mode = str(train_cfg["baseline_c_mode"]).lower().replace("-", "_")
+    if baseline_c_mode in {"docs", "wireless_flmin", "wireless_fl_original"}:
+        baseline_c_mode = "wireless_fl"
+    if baseline_c_mode not in {"current", "wireless_fl"}:
+        raise ValueError("training.baseline_c_mode must be 'current' or 'wireless_fl'")
+    verbose = bool(verbose or cfg["_verbose"])
+    if context is not None:
+        partitions = context.partitions
+        test_data = context.test_data
+        num_users = context.num_users
+        num_rbs = context.num_rbs
+        rounds = context.rounds
+        local_epochs = context.local_epochs
+        batch_size = context.batch_size
+        learning_rate = context.learning_rate
+        device = context.device
+        model_bits = context.model_bits
+        seed = context.seed
+        task = context.task
+        model = context.model_factory()
+        model.load_state_dict(copy.deepcopy(context.initial_model_state))
+    if context is not None:
+        seed = int(seed)
+    else:
+        seed_value = cfg["seed"] if seed is None else seed
+        if isinstance(seed_value, list):
+            if not seed_value:
+                raise ValueError("seed list must not be empty")
+            seed_value = seed_value[0]
+        seed = int(seed_value)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
-    regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
-    min_distance = float(wireless.get("min_distance_m", 5.0))
-    interference_sigma = float(wireless.get("interference_lognormal_sigma", 0.35))
-    rate_floor = float(wireless.get("rate_floor", 1e-12))
-    channel_gain_floor = float(wireless.get("channel_gain_floor", 1e-18))
-    snr_denominator_floor = float(wireless.get("snr_denominator_floor", 1e-18))
-    power_floor = float(wireless.get("power_floor_w", 1e-12))
-    power_solver_maxiter = int(wireless.get("power_solver_maxiter", 50))
+    eval_batch_size = int(train_cfg["eval_batch_size"])
+    regression_scale_floor = float(train_cfg["regression_scale_floor"])
+    min_distance = float(wireless["min_distance_m"])
+    interference_sigma = float(wireless["interference_lognormal_sigma"])
+    rate_floor = float(wireless["rate_floor"])
+    channel_gain_floor = float(wireless["channel_gain_floor"])
+    snr_denominator_floor = float(wireless["snr_denominator_floor"])
+    power_floor = float(wireless["power_floor_w"])
+    power_solver_maxiter = int(wireless["power_solver_maxiter"])
 
-    if partitions is not None:
+    if context is None and partitions is not None:
         num_users = len(partitions)
-    counts = np.array(
-        [
-            len(partitions[i]) if partitions is not None else wireless["ki_cycle"][i % len(wireless["ki_cycle"])]
-            for i in range(num_users)
-        ],
-        dtype=np.float64,
-    )
-    counts = np.maximum(counts, 1.0)
+    if context is not None:
+        counts = np.asarray(context.counts, dtype=np.float64)
+    else:
+        counts = np.array(
+            [
+                len(partitions[i]) if partitions is not None else wireless["ki_cycle"][i % len(wireless["ki_cycle"])]
+                for i in range(num_users)
+            ],
+            dtype=np.float64,
+        )
+    if context is None:
+        counts = np.maximum(counts, 1.0)
 
+    mnist_activation = str(train_cfg["mnist_activation"]).lower()
     if model is None:
-        model = RegressionFNN() if task == "regression" else MNISTFNN()
+        model = RegressionFNN() if task == "regression" else MNISTFNN(activation=mnist_activation)
     if isinstance(model, type):
-        model = model()
+        model = model(activation=mnist_activation) if model is MNISTFNN else model()
     if model_bits is None:
-        quantization_bits = train_cfg.get("quantization_bits")
+        quantization_bits = train_cfg["quantization_bits"]
         if quantization_bits is None:
             model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
         else:
             model_bits = int(sum(parameter.numel() for parameter in model.parameters()) * int(quantization_bits))
 
-    radius = float(wireless["radius_m"])
-    distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
-    fading = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs))
-    channel_gain = fading * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
-    downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
+    # Wireless matrices are intentionally the same as other schemes for fair comparison.
+    if context is not None:
+        distances = np.asarray(context.distances, dtype=np.float64)
+        channel_gain = np.asarray(context.channel_gain, dtype=np.float64)
+        downlink_gain = np.asarray(context.downlink_gain, dtype=np.float64)
+    else:
+        radius = float(wireless["radius_m"])
+        distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
+        channel_model = str(wireless["channel_model"]).lower()
+        if channel_model == "mean":
+            channel_gain = float(wireless["rayleigh_mean"]) * np.ones((num_users, num_rbs), dtype=np.float64) * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+            downlink_gain = float(wireless["rayleigh_mean"]) * distances ** (-float(wireless["path_loss_alpha"]))
+        elif channel_model == "rayleigh":
+            channel_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs)) * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+            downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
+        else:
+            raise ValueError("wireless.channel_model must be 'mean' or 'rayleigh'")
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference_by_rbs = wireless.get("interference_w_by_rbs", {})
-    interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
-    if interference_profile is None and isinstance(interference_by_rbs, dict):
-        interference_profile = interference_by_rbs.get(num_rbs)
-    if interference_profile is not None:
-        interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
-        if interference.size != num_rbs:
-            raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
+    if context is not None:
+        interference = np.maximum(np.asarray(context.interference, dtype=np.float64), 0.0)
     else:
-        interference_w = float(wireless["interference_w"])
-        if interference_w <= 0.0:
-            interference = np.zeros(num_rbs, dtype=np.float64)
+        interference_by_rbs = wireless["interference_w_by_rbs"]
+        interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
+        if interference_profile is None and isinstance(interference_by_rbs, dict):
+            interference_profile = interference_by_rbs.get(num_rbs)
+        if interference_profile is not None:
+            interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
+            if interference.size != num_rbs:
+                raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
         else:
-            interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
-    downlink_interference = float(wireless["downlink_interference_w"])
+            interference_w = float(wireless["interference_w"])
+            if interference_w <= 0.0:
+                interference = np.zeros(num_rbs, dtype=np.float64)
+            else:
+                interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
+    if context is not None:
+        downlink_interference = float(context.downlink_interference)
+    else:
+        downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
     gamma_t = float(wireless["delay_s"])
@@ -913,21 +1510,29 @@ def baseline_c(
             energies[user_idx, rb_idx] = energy
             feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
 
-    weights = np.where(feasible, packet_errors - 1.0, 0.0)
-    assignment_users = []
-    rows, cols = linear_sum_assignment(weights)
-    for row, col in zip(rows, cols):
-        if feasible[row, col] and weights[row, col] < 0.0:
-            assignment_users.append(int(row))
-
     allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
     selected_users = []
     assigned_rbs = []
-    random_rbs = rng.permutation(num_rbs)[:len(assignment_users)]
-    for user_idx, rb_idx in zip(assignment_users, random_rbs):
-        allocation[user_idx, rb_idx] = 1
-        selected_users.append(user_idx)
-        assigned_rbs.append(int(rb_idx))
+    if baseline_c_mode == "current":
+        # Current mode: wireless-only Hungarian assignment over feasible q values.
+        weights = np.where(feasible, packet_errors - 1.0, 0.0)
+        rows, cols = linear_sum_assignment(weights)
+        for row, col in zip(rows, cols):
+            if np.isfinite(weights[row, col]) and weights[row, col] < 0.0:
+                allocation[row, col] = 1
+                selected_users.append(int(row))
+                assigned_rbs.append(int(col))
+    else:
+        # docs/Wireless-FL/FLMIN.m baseline 3:
+        # Munkres selects the users from W=q, then qassignment is randomized.
+        weights = np.zeros((num_users, num_rbs), dtype=np.float64)
+        weights[feasible] = packet_errors[feasible]
+        rows, _cols = linear_sum_assignment(weights)
+        selected_users = [int(row) for row in rows]
+        random_rbs = rng.permutation(num_rbs)[:len(selected_users)]
+        for user_idx, rb_idx in zip(selected_users, random_rbs):
+            allocation[user_idx, int(rb_idx)] = 1
+            assigned_rbs.append(int(rb_idx))
 
     solver_iterations = int(num_users * num_rbs)
     selected_users = np.array(selected_users, dtype=np.int64)
@@ -944,6 +1549,7 @@ def baseline_c(
     metrics = {"loss": [], "accuracy": [], "successful_users": []}
     trained_state = None
     if rounds > 0 and partitions is not None:
+        baseline_c_aggregation = "fedavg"
         device_name = device or train_cfg["device"]
         if device_name == "auto":
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
@@ -951,49 +1557,49 @@ def baseline_c(
         global_model = model.to(device_obj)
         loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
-        regression_loss = str(train_cfg.get("regression_loss", "mse")).lower()
+        regression_loss = str(train_cfg["regression_loss"]).lower()
         if regression_loss not in {"mse", "nmse"}:
             raise ValueError("training.regression_loss must be 'mse' or 'nmse'")
+        round_context = Context(
+            seed=seed,
+            task=task,
+            partitions=partitions,
+            test_data=test_data,
+            counts=counts,
+            num_users=num_users,
+            model_bits=model_bits,
+            num_rbs=num_rbs,
+            powers=powers,
+            packet_errors=packet_errors,
+            uplink_rates=uplink_rates,
+            downlink_rates=downlink_rates,
+            total_delays=total_delays,
+            energies=energies,
+            feasible=feasible,
+            delay_s=gamma_t,
+            energy_j=gamma_e,
+            pmax_w=pmax,
+            rounds=rounds,
+            local_epochs=local_epochs,
+            learning_rate=lr,
+            batch_size=batch_size,
+            device=device_name,
+            loss=cfg,
+        )
 
-        for _ in range(int(rounds)):
-            local_states = []
-            local_weights = []
-            successes = 0
-            for user_idx, rb_idx, packet_error in zip(selected_users, assigned_rbs, selected_errors):
-                local_model = copy.deepcopy(global_model).to(device_obj)
-                local_model.train()
-                optimizer = torch.optim.SGD(local_model.parameters(), lr=lr)
-                loader = DataLoader(partitions[int(user_idx)], batch_size=min(batch_size, len(partitions[int(user_idx)])), shuffle=True)
-                for _local_epoch in range(int(local_epochs)):
-                    for features, labels in loader:
-                        features = features.to(device_obj)
-                        labels = labels.to(device_obj)
-                        optimizer.zero_grad()
-                        prediction = local_model(features)
-                        if task == "regression":
-                            target = labels.float().reshape_as(prediction)
-                            error = prediction - target
-                            squared_error = error.pow(2)
-                            if regression_loss == "nmse":
-                                target_range = (target.max() - target.min()).clamp_min(regression_scale_floor)
-                                loss = (2.0 * error / target_range).pow(2).mean()
-                            else:
-                                loss = squared_error.mean()
-                        else:
-                            loss = loss_fn(prediction, labels.long())
-                        loss.backward()
-                        optimizer.step()
-                if rng.random() > packet_error:
-                    local_states.append({name: value.detach().cpu() for name, value in local_model.state_dict().items()})
-                    local_weights.append(float(len(partitions[int(user_idx)])))
-                    successes += 1
-
-            if local_states:
-                total_weight = sum(local_weights)
-                averaged = {}
-                for name in local_states[0]:
-                    averaged[name] = sum(state[name] * (weight / total_weight) for state, weight in zip(local_states, local_weights))
-                global_model.load_state_dict(averaged)
+        for round_index in range(int(rounds)):
+            successes = fl_one_round(
+                round_context,
+                global_model,
+                selected_users,
+                assigned_rbs,
+                selected_errors,
+                rng,
+                round_index=round_index,
+                aggregation=baseline_c_aggregation,
+                verbose=verbose,
+                scheme="baseline_c",
+            )
 
             global_model.eval()
             eval_loss = 0.0
@@ -1013,11 +1619,11 @@ def baseline_c(
             loader = DataLoader(eval_source, batch_size=eval_batch_size, shuffle=False)
             with torch.no_grad():
                 for features, labels in loader:
-                    features = features.to(device_obj)
+                    features = features.to(device_obj, dtype=next(global_model.parameters()).dtype)
                     labels = labels.to(device_obj)
                     prediction = global_model(features)
                     if task == "regression":
-                        target = labels.float().reshape_as(prediction)
+                        target = labels.to(device_obj, dtype=prediction.dtype).reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
                         eval_target_min = min(eval_target_min, float(target.min().item()))
                         eval_target_max = max(eval_target_max, float(target.max().item()))
@@ -1051,6 +1657,8 @@ def baseline_c(
         "energies": energies,
         "model_bits": model_bits,
         "counts": counts,
+        "baseline_c_mode": baseline_c_mode,
+        "baseline_c_aggregation": "fedavg",
         "solver_iterations": solver_iterations,
         "metrics": metrics,
         "model_state": trained_state,
@@ -1079,70 +1687,120 @@ def proposed_algorithm(
     learning_rate=None,
     model_bits=None,
     resource_search="hungarian",
+    verbose=False,
 ):
-    """Run the paper's wireless-aware user/RB/power selection, optionally followed by FedAvg."""
-    cfg = load_yaml() if config is None else config
+    """Run wireless-aware user/RB/power selection, optionally followed by full-batch GD FedAvg."""
+    # Proposed FL jointly uses Ki and packet error in the Hungarian edge cost.
+    context = partitions if isinstance(partitions, Context) else None
+    cfg = context.loss if context is not None else (build_contexts()[0].loss if config is None else config)
     wireless = cfg["wireless"]
     train_cfg = cfg["training"]
-    seed = int(cfg["seed"] if seed is None else seed)
+    verbose = bool(verbose or cfg["_verbose"])
+    if context is not None:
+        partitions = context.partitions
+        test_data = context.test_data
+        num_users = context.num_users
+        num_rbs = context.num_rbs
+        rounds = context.rounds
+        local_epochs = context.local_epochs
+        batch_size = context.batch_size
+        learning_rate = context.learning_rate
+        device = context.device
+        model_bits = context.model_bits
+        seed = context.seed
+        task = context.task
+        model = context.model_factory()
+        model.load_state_dict(copy.deepcopy(context.initial_model_state))
+    if context is not None:
+        seed = int(seed)
+    else:
+        seed_value = cfg["seed"] if seed is None else seed
+        if isinstance(seed_value, list):
+            if not seed_value:
+                raise ValueError("seed list must not be empty")
+            seed_value = seed_value[0]
+        seed = int(seed_value)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    eval_batch_size = int(train_cfg.get("eval_batch_size", 256))
-    regression_scale_floor = float(train_cfg.get("regression_scale_floor", 1e-12))
-    min_distance = float(wireless.get("min_distance_m", 5.0))
-    interference_sigma = float(wireless.get("interference_lognormal_sigma", 0.35))
-    rate_floor = float(wireless.get("rate_floor", 1e-12))
-    channel_gain_floor = float(wireless.get("channel_gain_floor", 1e-18))
-    snr_denominator_floor = float(wireless.get("snr_denominator_floor", 1e-18))
-    power_floor = float(wireless.get("power_floor_w", 1e-12))
-    power_solver_maxiter = int(wireless.get("power_solver_maxiter", 50))
-    heuristic_max_rbs = int(wireless.get("heuristic_max_rbs", 20))
+    eval_batch_size = int(train_cfg["eval_batch_size"])
+    regression_scale_floor = float(train_cfg["regression_scale_floor"])
+    min_distance = float(wireless["min_distance_m"])
+    interference_sigma = float(wireless["interference_lognormal_sigma"])
+    rate_floor = float(wireless["rate_floor"])
+    channel_gain_floor = float(wireless["channel_gain_floor"])
+    snr_denominator_floor = float(wireless["snr_denominator_floor"])
+    power_floor = float(wireless["power_floor_w"])
+    power_solver_maxiter = int(wireless["power_solver_maxiter"])
+    heuristic_max_rbs = int(wireless["heuristic_max_rbs"])
 
-    if partitions is not None:
+    if context is None and partitions is not None:
         num_users = len(partitions)
-    counts = np.array(
-        [
-            len(partitions[i]) if partitions is not None else wireless["ki_cycle"][i % len(wireless["ki_cycle"])]
-            for i in range(num_users)
-        ],
-        dtype=np.float64,
-    )
-    counts = np.maximum(counts, 1.0)
+    if context is not None:
+        counts = np.asarray(context.counts, dtype=np.float64)
+    else:
+        counts = np.array(
+            [
+                len(partitions[i]) if partitions is not None else wireless["ki_cycle"][i % len(wireless["ki_cycle"])]
+                for i in range(num_users)
+            ],
+            dtype=np.float64,
+        )
+    if context is None:
+        counts = np.maximum(counts, 1.0)
 
+    mnist_activation = str(train_cfg["mnist_activation"]).lower()
     if model is None:
-        model = RegressionFNN() if task == "regression" else MNISTFNN()
+        model = RegressionFNN() if task == "regression" else MNISTFNN(activation=mnist_activation)
     if isinstance(model, type):
-        model = model()
+        model = model(activation=mnist_activation) if model is MNISTFNN else model()
     if model_bits is None:
-        quantization_bits = train_cfg.get("quantization_bits")
+        quantization_bits = train_cfg["quantization_bits"]
         if quantization_bits is None:
             model_bits = int(sum(parameter.numel() * parameter.element_size() * 8 for parameter in model.parameters()))
         else:
             model_bits = int(sum(parameter.numel() for parameter in model.parameters()) * int(quantization_bits))
 
-    radius = float(wireless["radius_m"])
-    distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
-    fading = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs))
-    channel_gain = fading * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
-    downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
+    # One sampled cellular layout is held fixed for all FL rounds in this run.
+    if context is not None:
+        distances = np.asarray(context.distances, dtype=np.float64)
+        channel_gain = np.asarray(context.channel_gain, dtype=np.float64)
+        downlink_gain = np.asarray(context.downlink_gain, dtype=np.float64)
+    else:
+        radius = float(wireless["radius_m"])
+        distances = np.maximum(min_distance, radius * np.sqrt(rng.random(num_users)))
+        channel_model = str(wireless["channel_model"]).lower()
+        if channel_model == "mean":
+            channel_gain = float(wireless["rayleigh_mean"]) * np.ones((num_users, num_rbs), dtype=np.float64) * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+            downlink_gain = float(wireless["rayleigh_mean"]) * distances ** (-float(wireless["path_loss_alpha"]))
+        elif channel_model == "rayleigh":
+            channel_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=(num_users, num_rbs)) * distances[:, None] ** (-float(wireless["path_loss_alpha"]))
+            downlink_gain = rng.exponential(float(wireless["rayleigh_mean"]), size=num_users) * distances ** (-float(wireless["path_loss_alpha"]))
+        else:
+            raise ValueError("wireless.channel_model must be 'mean' or 'rayleigh'")
     n0_w_hz = 10.0 ** ((float(wireless["noise_dbm_hz"]) - 30.0) / 10.0)
     uplink_bandwidth = float(wireless["uplink_bandwidth_hz"])
     downlink_bandwidth = float(wireless["downlink_bandwidth_hz"])
-    interference_by_rbs = wireless.get("interference_w_by_rbs", {})
-    interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
-    if interference_profile is None and isinstance(interference_by_rbs, dict):
-        interference_profile = interference_by_rbs.get(num_rbs)
-    if interference_profile is not None:
-        interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
-        if interference.size != num_rbs:
-            raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
+    if context is not None:
+        interference = np.maximum(np.asarray(context.interference, dtype=np.float64), 0.0)
     else:
-        interference_w = float(wireless["interference_w"])
-        if interference_w <= 0.0:
-            interference = np.zeros(num_rbs, dtype=np.float64)
+        interference_by_rbs = wireless["interference_w_by_rbs"]
+        interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
+        if interference_profile is None and isinstance(interference_by_rbs, dict):
+            interference_profile = interference_by_rbs.get(num_rbs)
+        if interference_profile is not None:
+            interference = np.maximum(np.asarray(interference_profile, dtype=np.float64), 0.0)
+            if interference.size != num_rbs:
+                raise ValueError(f"wireless.interference_w_by_rbs[{num_rbs}] must contain {num_rbs} values")
         else:
-            interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
-    downlink_interference = float(wireless["downlink_interference_w"])
+            interference_w = float(wireless["interference_w"])
+            if interference_w <= 0.0:
+                interference = np.zeros(num_rbs, dtype=np.float64)
+            else:
+                interference = rng.lognormal(mean=math.log(interference_w), sigma=interference_sigma, size=num_rbs)
+    if context is not None:
+        downlink_interference = float(context.downlink_interference)
+    else:
+        downlink_interference = float(wireless["downlink_interference_w"])
     bs_power = float(wireless["bs_power_w"])
     pmax = float(wireless["pmax_w"])
     gamma_t = float(wireless["delay_s"])
@@ -1166,6 +1824,7 @@ def proposed_algorithm(
     )
     downlink_delays = model_bits / np.maximum(downlink_rates, rate_floor)
 
+    # Compute all candidate user-RB edges before solving assignment.
     for user_idx in range(num_users):
         for rb_idx in range(num_rbs):
             gain = max(channel_gain[user_idx, rb_idx], channel_gain_floor)
@@ -1201,11 +1860,13 @@ def proposed_algorithm(
             feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
 
     resource_search = str(resource_search)
+    # Equation (24): feasible edges get Ki(q-1), infeasible edges are neutral.
     weights = np.where(feasible, counts[:, None] * (packet_errors - 1.0), 0.0)
     allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
     selected_users = []
     assigned_rbs = []
     if resource_search == "hungarian":
+        # This is Algorithm 1's bipartite matching step.
         solver_iterations = int(num_users * num_rbs)
         rows, cols = linear_sum_assignment(weights)
         for row, col in zip(rows, cols):
@@ -1214,6 +1875,7 @@ def proposed_algorithm(
                 selected_users.append(int(row))
                 assigned_rbs.append(int(col))
     elif resource_search == "heuristic":
+        # The heuristic branch is an exact dynamic search for small RB counts.
         if num_rbs > heuristic_max_rbs:
             raise ValueError(f"heuristic resource search supports up to {heuristic_max_rbs} RBs")
         memo = {}
@@ -1266,6 +1928,7 @@ def proposed_algorithm(
     metrics = {"loss": [], "accuracy": [], "successful_users": []}
     trained_state = None
     if rounds > 0 and partitions is not None:
+        # After assignment, FL training differs only through packet success draws.
         device_name = device or train_cfg["device"]
         if device_name == "auto":
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1273,49 +1936,49 @@ def proposed_algorithm(
         global_model = model.to(device_obj)
         loss_fn = nn.CrossEntropyLoss()
         lr = float(learning_rate if learning_rate is not None else (train_cfg["regression_lr"] if task == "regression" else train_cfg["mnist_lr"]))
-        regression_loss = str(train_cfg.get("regression_loss", "mse")).lower()
+        regression_loss = str(train_cfg["regression_loss"]).lower()
         if regression_loss not in {"mse", "nmse"}:
             raise ValueError("training.regression_loss must be 'mse' or 'nmse'")
+        round_context = Context(
+            seed=seed,
+            task=task,
+            partitions=partitions,
+            test_data=test_data,
+            counts=counts,
+            num_users=num_users,
+            model_bits=model_bits,
+            num_rbs=num_rbs,
+            powers=powers,
+            packet_errors=packet_errors,
+            uplink_rates=uplink_rates,
+            downlink_rates=downlink_rates,
+            total_delays=total_delays,
+            energies=energies,
+            feasible=feasible,
+            delay_s=gamma_t,
+            energy_j=gamma_e,
+            pmax_w=pmax,
+            rounds=rounds,
+            local_epochs=local_epochs,
+            learning_rate=lr,
+            batch_size=batch_size,
+            device=device_name,
+            loss=cfg,
+        )
 
-        for _ in range(int(rounds)):
-            local_states = []
-            local_weights = []
-            successes = 0
-            for user_idx, rb_idx, packet_error in zip(selected_users, assigned_rbs, selected_errors):
-                local_model = copy.deepcopy(global_model).to(device_obj)
-                local_model.train()
-                optimizer = torch.optim.SGD(local_model.parameters(), lr=lr)
-                loader = DataLoader(partitions[int(user_idx)], batch_size=min(batch_size, len(partitions[int(user_idx)])), shuffle=True)
-                for _local_epoch in range(int(local_epochs)):
-                    for features, labels in loader:
-                        features = features.to(device_obj)
-                        labels = labels.to(device_obj)
-                        optimizer.zero_grad()
-                        prediction = local_model(features)
-                        if task == "regression":
-                            target = labels.float().reshape_as(prediction)
-                            error = prediction - target
-                            squared_error = error.pow(2)
-                            if regression_loss == "nmse":
-                                target_range = (target.max() - target.min()).clamp_min(regression_scale_floor)
-                                loss = (2.0 * error / target_range).pow(2).mean()
-                            else:
-                                loss = squared_error.mean()
-                        else:
-                            loss = loss_fn(prediction, labels.long())
-                        loss.backward()
-                        optimizer.step()
-                if rng.random() > packet_error:
-                    local_states.append({name: value.detach().cpu() for name, value in local_model.state_dict().items()})
-                    local_weights.append(float(len(partitions[int(user_idx)])))
-                    successes += 1
-
-            if local_states:
-                total_weight = sum(local_weights)
-                averaged = {}
-                for name in local_states[0]:
-                    averaged[name] = sum(state[name] * (weight / total_weight) for state, weight in zip(local_states, local_weights))
-                global_model.load_state_dict(averaged)
+        for round_index in range(int(rounds)):
+            successes = fl_one_round(
+                round_context,
+                global_model,
+                selected_users,
+                assigned_rbs,
+                selected_errors,
+                rng,
+                round_index=round_index,
+                aggregation="fedavg",
+                verbose=verbose,
+                scheme="proposed" if resource_search == "hungarian" else "optimal_fl",
+            )
 
             global_model.eval()
             eval_loss = 0.0
@@ -1335,11 +1998,11 @@ def proposed_algorithm(
             loader = DataLoader(eval_source, batch_size=eval_batch_size, shuffle=False)
             with torch.no_grad():
                 for features, labels in loader:
-                    features = features.to(device_obj)
+                    features = features.to(device_obj, dtype=next(global_model.parameters()).dtype)
                     labels = labels.to(device_obj)
                     prediction = global_model(features)
                     if task == "regression":
-                        target = labels.float().reshape_as(prediction)
+                        target = labels.to(device_obj, dtype=prediction.dtype).reshape_as(prediction)
                         eval_loss += float((prediction - target).pow(2).sum().item())
                         eval_target_min = min(eval_target_min, float(target.min().item()))
                         eval_target_max = max(eval_target_max, float(target.max().item()))
@@ -1387,16 +2050,68 @@ def proposed_algorithm(
 
 
 # utils
-def load_yaml(path=None):
-    """Load an optional YAML override on top of Table II/default experiment settings."""
+def build_contexts(path=None) -> list[Context]:
+    """Build concrete experiment contexts from a configs/*.yaml file."""
+    if path is None:
+        path = Path("configs/sweep.yaml")
+    else:
+        path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Configuration file is required for non-paper parameters: {path}")
+
+    with open(path, "r", encoding="utf-8") as handle:
+        override = yaml.safe_load(handle) or {}
+
+    required_yaml_keys = {
+        "wireless": [
+            "waterfall_threshold",
+            "channel_model",
+            "interference_w",
+            "interference_w_by_rbs",
+            "downlink_interference_w",
+            "min_distance_m",
+            "interference_lognormal_sigma",
+            "rate_floor",
+            "channel_gain_floor",
+            "snr_denominator_floor",
+            "power_floor_w",
+            "power_solver_maxiter",
+            "heuristic_max_rbs",
+        ],
+        "training": [
+            "baseline_c_mode",
+            "quantization_bits",
+            "eval_batch_size",
+            "mnist_activation",
+            "mnist_train_order",
+            "mnist_partition_order",
+            "force_first_round_success",
+            "regression_loss",
+            "regression_scale_floor",
+        ],
+    }
+    missing = []
+    for section_name, keys in required_yaml_keys.items():
+        if section_name not in override or not isinstance(override[section_name], dict):
+            missing.extend(f"{section_name}.{key}" for key in keys)
+            continue
+        section = override[section_name]
+        for key in keys:
+            if key not in section:
+                missing.append(f"{section_name}.{key}")
+    if missing:
+        raise ValueError("configs/*.yaml must explicitly provide non-paper parameters: " + ", ".join(missing))
+
+    # Defaults encode paper/Table-II parameters; YAML supplies non-paper sweep choices.
     config = {
-        "seed": SEED,
+        "seed": 42,
         "wireless": {
             "radius_m": 500.0,
             "path_loss_alpha": 2.0,
             "bs_power_w": 1.0,
             "waterfall_threshold": 10.0 ** (0.023 / 10.0),
             "rayleigh_mean": 1.0,
+            "channel_model": "mean",
             "cpu_frequency_hz": 1e9,
             "energy_coefficient": 1e-27,
             "cpu_cycles_per_bit": 40.0,
@@ -1421,8 +2136,14 @@ def load_yaml(path=None):
         },
         "training": {
             "device": "auto",
+            "baseline_c_mode": "current",
+            "optimizer": "gradient_descent",
             "quantization_bits": 16,
             "eval_batch_size": 256,
+            "mnist_activation": "relu",
+            "mnist_train_order": "shuffled",
+            "mnist_partition_order": "shuffled",
+            "force_first_round_success": False,
             "regression_loss": "nmse",
             "regression_scale_floor": 1e-12,
             "regression_lr": 0.08,
@@ -1435,7 +2156,6 @@ def load_yaml(path=None):
                 "rounds": 80,
                 "num_rbs": 12,
                 "local_epochs": 1,
-                "batch_size": 32,
                 "activation": "tanh",
                 "learning_rate": 0.01,
             },
@@ -1444,15 +2164,12 @@ def load_yaml(path=None):
                 "rounds": 60,
                 "num_rbs": 12,
                 "local_epochs": 1,
-                "batch_size": 32,
                 "activation": "tanh",
                 "learning_rate": 0.01,
-                "average_seeds": [0, 42, 1004],
             },
             "figure_5": {
                 "user_counts": [3, 6, 10, 15, 20, 25],
                 "rb_counts": [10, 15],
-                "average_seeds": [0, 42, 1004],
             },
             "figure_6": {
                 "user_counts": [3, 6, 9, 12, 15, 18],
@@ -1466,87 +2183,173 @@ def load_yaml(path=None):
                 "lipschitz_l": 1.0,
                 "gradient_bound_zeta1": 1.0,
                 "gradient_bound_zeta2": 0.5,
-                "average_seeds": [0, 42, 1004],
             },
             "figure_7": {
                 "samples_per_user": [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100],
-                "test_samples": 1000,
+                "test_samples": 10000,
                 "rounds": 130,
                 "num_rbs": 12,
                 "local_epochs": 1,
-                "batch_size": 32,
                 "learning_rate": 0.08,
-                "average_seeds": [0, 42, 1004],
             },
             "figure_8": {
                 "user_counts": [3, 6, 9, 12, 15, 18],
                 "samples_per_user": [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100, 200, 300, 400],
-                "test_samples": 1000,
+                "test_samples": 10000,
                 "rounds": 130,
                 "num_rbs": 12,
                 "local_epochs": 1,
-                "batch_size": 32,
                 "learning_rate": 0.08,
-                "average_seeds": [0, 42, 1004],
             },
             "figure_9": {
                 "rb_counts": [3, 6, 9, 12],
                 "samples_per_user": [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100],
-                "test_samples": 1000,
+                "test_samples": 10000,
                 "rounds": 130,
                 "local_epochs": 1,
-                "batch_size": 32,
                 "learning_rate": 0.08,
-                "average_seeds": [0, 42, 1004],
+            },
+            "figure_10": {
+                "samples_per_user": 2000,
+                "test_samples": 10000,
+                "rounds": 130,
+                "num_rbs": 12,
+                "local_epochs": 1,
+                "learning_rate": 0.08,
             },
         },
     }
-    if path is None:
-        return config
-
-    with open(path, "r", encoding="utf-8") as handle:
-        override = yaml.safe_load(handle) or {}
+    # Merge user YAML recursively so partial override files stay compact.
     stack = [(config, override)]
     while stack:
         base, update = stack.pop()
         for key, value in update.items():
-            if isinstance(value, dict) and isinstance(base.get(key), dict):
+            if isinstance(value, dict) and key in base and isinstance(base[key], dict):
                 stack.append((base[key], value))
             else:
                 base[key] = value
-    for section_name in ("wireless", "training"):
-        section = config.get(section_name, {})
-        for key, value in list(section.items()):
-            if isinstance(value, list) and len(value) == 1 and (key != "ki_cycle" or isinstance(value[0], list)):
-                section[key] = value[0]
-    return config
+    def candidate_values(key, value):
+        # Lists mean experiment candidates. Nested lists encode vector-valued parameters.
+        if not isinstance(value, list):
+            return [value]
+        if not value:
+            raise ValueError(f"{key} must not be an empty list")
+        if key.endswith("ki_cycle") and not isinstance(value[0], list):
+            return [value]
+        if isinstance(value[0], list):
+            return value
+        return value
+
+    contexts = []
+    if "figures" not in override or not isinstance(override["figures"], dict):
+        raise ValueError("configs/*.yaml must explicitly provide figures")
+    figure_source = override["figures"]
+    for figure_key in figure_source:
+        if not figure_key.startswith("figure_"):
+            continue
+        figure_config = config["figures"][figure_key]
+        figure_name = figure_key.split("_", 1)[1]
+        seed_source = config["seed"]
+        seed_values = candidate_values("seed", seed_source)
+        run_values = []
+        for seed_value in seed_values:
+            filename_settings = {"seed": int(seed_value)} if isinstance(seed_source, list) else {}
+            varied = {"seed": int(seed_value)} if len(seed_values) > 1 else {}
+            run_values.append(({}, varied, filename_settings, int(seed_value)))
+        for section_name in ("wireless", "training"):
+            section_config = config[section_name]
+            for key, value in section_config.items():
+                composite_key = f"{section_name}.{key}"
+                values = candidate_values(composite_key, value)
+                next_run_values = []
+                for existing, varied, filename_settings, seed_value in run_values:
+                    for candidate in values:
+                        updated = dict(existing)
+                        updated[composite_key] = candidate
+                        updated_varied = dict(varied)
+                        if len(values) > 1:
+                            updated_varied[composite_key] = candidate
+                        updated_filename_settings = dict(filename_settings)
+                        if len(values) > 1:
+                            updated_filename_settings[composite_key] = candidate
+                        next_run_values.append((updated, updated_varied, updated_filename_settings, seed_value))
+                run_values = next_run_values
+        for key, value in figure_config.items():
+            values = candidate_values(key, value)
+            next_run_values = []
+            for existing, varied, filename_settings, seed_value in run_values:
+                for candidate in values:
+                    updated = dict(existing)
+                    updated[key] = candidate
+                    updated_varied = dict(varied)
+                    if len(values) > 1:
+                        updated_varied[key] = candidate
+                    updated_filename_settings = dict(filename_settings)
+                    if isinstance(value, list):
+                        updated_filename_settings[key] = candidate
+                    next_run_values.append((updated, updated_varied, updated_filename_settings, seed_value))
+            run_values = next_run_values
+
+        for values, varied, filename_settings, seed_value in run_values:
+            run_config = copy.deepcopy(config)
+            figure_values = {}
+            for key, value in values.items():
+                if "." in key:
+                    section_name, section_key = key.split(".", 1)
+                    run_config[section_name][section_key] = value
+                else:
+                    figure_values[key] = value
+            run_config["figures"][figure_key].update(figure_values)
+            run_config["seed"] = seed_value
+            run_config["_figure"] = figure_name
+            run_config["_plot"] = False
+            run_config["_run_seeds"] = [seed_value]
+            run_config["_varied"] = varied
+            run_config["_filename_settings"] = filename_settings
+            run_config["_verbose"] = False
+            run_config["_verbose_log_path"] = str(Path("outputs") / "verbose_logs" / f"figure_{figure_name}.txt")
+            contexts.append(Context(seed=seed_value, loss=run_config))
+    return contexts
 
 
 # figures
-def figure_3(plot=False, seed=SEED, config=None):
-    cfg = load_yaml() if config is None else config
-    figure_cfg = cfg.get("figures", {}).get("figure_3", {})
+def figure_3(contexts):
+    # Fig. 3 validates fitted regression curves under each wireless-FL scheme.
+    context = contexts[0]
+    seed = int(context.seed)
+    cfg = context.loss
+    plot = bool(cfg["_plot"])
+    figure_cfg = cfg["figures"]["figure_3"]
 
     def first_candidate(value):
+        # Figure functions execute one candidate at a time; main handles sweeps.
         if isinstance(value, list):
             if not value:
                 raise ValueError("Figure configuration candidate lists must not be empty")
             return value[0]
         return value
 
-    data_count = int(first_candidate(figure_cfg.get("data_count", 50)))
-    test_count = int(first_candidate(figure_cfg.get("test_count", 1000)))
-    rounds = int(first_candidate(figure_cfg.get("rounds", 80)))
-    num_rbs = int(first_candidate(figure_cfg.get("num_rbs", 12)))
-    local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
-    batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
-    activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
-    learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["regression_lr"])))
-    regression_loss = str(first_candidate(figure_cfg.get("regression_loss", first_candidate(cfg["training"].get("regression_loss", "mse"))))).lower()
+    data_count = int(first_candidate(figure_cfg["data_count"]))
+    test_count = int(first_candidate(figure_cfg["test_count"]))
+    rounds = int(first_candidate(figure_cfg["rounds"]))
+    num_rbs = int(first_candidate(figure_cfg["num_rbs"]))
+    local_epochs = int(first_candidate(figure_cfg["local_epochs"]))
+    activation = str(first_candidate(figure_cfg["activation"]))
+    learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
+    regression_loss = str(first_candidate(cfg["training"]["regression_loss"])).lower()
+    quantization_bits = int(first_candidate(cfg["training"]["quantization_bits"]))
+    if quantization_bits == 16:
+        compute_dtype = torch.float16
+    elif quantization_bits == 32:
+        compute_dtype = torch.float32
+    elif quantization_bits == 64:
+        compute_dtype = torch.float64
+    else:
+        raise ValueError("training.quantization_bits supports actual compute dtype only for 16, 32, or 64 bits")
     if regression_loss not in {"mse", "nmse"}:
         raise ValueError("regression_loss must be 'mse' or 'nmse'")
     run_config = copy.deepcopy(cfg)
-    run_config.setdefault("training", {})["regression_loss"] = regression_loss
+    run_config["training"]["regression_loss"] = regression_loss
     base_count = data_count // 15
     remainder = data_count % 15
     samples_per_user = [base_count + (1 if user_idx < remainder else 0) for user_idx in range(15)]
@@ -1562,22 +2365,28 @@ def figure_3(plot=False, seed=SEED, config=None):
             "rounds": rounds,
             "num_rbs": num_rbs,
             "local_epochs": local_epochs,
-            "batch_size": batch_size,
+            "optimizer": "full_batch_gradient_descent",
             "activation": activation,
             "learning_rate": learning_rate,
+            "quantization_bits": quantization_bits,
+            "compute_dtype": str(compute_dtype).replace("torch.", ""),
             "loss_function": regression_loss,
             "optimal_resource_search": "heuristic",
         }
     }
+    torch.manual_seed(seed)
+    initial_model = RegressionFNN(activation=activation)
+    initial_state = {name: value.detach().clone() for name, value in initial_model.state_dict().items()}
+    optimal_model = RegressionFNN(activation=activation)
+    optimal_model.load_state_dict(copy.deepcopy(initial_state))
     optimal = proposed_algorithm(
         data["users"],
-        RegressionFNN(activation=activation),
+        optimal_model,
         task="regression",
         test_data=test_data,
         rounds=rounds,
         num_rbs=num_rbs,
         local_epochs=local_epochs,
-        batch_size=batch_size,
         learning_rate=learning_rate,
         resource_search="heuristic",
         seed=seed,
@@ -1590,15 +2399,16 @@ def figure_3(plot=False, seed=SEED, config=None):
         "model_state": optimal["model_state"],
     }
     for name, runner in {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}.items():
+        model_instance = RegressionFNN(activation=activation)
+        model_instance.load_state_dict(copy.deepcopy(initial_state))
         output = runner(
             data["users"],
-            RegressionFNN(activation=activation),
+            model_instance,
             task="regression",
             test_data=test_data,
             rounds=rounds,
             num_rbs=num_rbs,
             local_epochs=local_epochs,
-            batch_size=batch_size,
             learning_rate=learning_rate,
             seed=seed,
             config=run_config,
@@ -1619,10 +2429,10 @@ def figure_3(plot=False, seed=SEED, config=None):
             ("baseline_a", "Baseline a)", "black", "-", 2.0),
             ("baseline_b", "Baseline b)", "limegreen", "-", 2.0),
         ]:
-            fitted = RegressionFNN(activation=activation)
+            fitted = RegressionFNN(activation=activation).to(dtype=compute_dtype)
             fitted.load_state_dict(result[key]["model_state"])
             with torch.no_grad():
-                prediction = fitted(xs).numpy().ravel()
+                prediction = fitted(xs.to(dtype=compute_dtype)).float().numpy().ravel()
             ax.plot(result["x_grid"], prediction, color=color, linestyle=linestyle, linewidth=linewidth, label=label)
         ax.set_xlabel("Input of the FL algorithm")
         ax.set_ylabel("Output of the FL algorithm")
@@ -1636,9 +2446,19 @@ def figure_3(plot=False, seed=SEED, config=None):
     return result
 
 
-def figure_4(plot=False, seed=SEED, config=None):
-    cfg = load_yaml() if config is None else config
-    figure_cfg = cfg.get("figures", {}).get("figure_4", {})
+def figure_4(contexts):
+    # Fig. 4 varies per-user regression samples and reports final training loss.
+    context = contexts[0]
+    seed = int(context.seed)
+    cfg = context.loss
+    plot = bool(cfg["_plot"])
+    figure_cfg = cfg["figures"]["figure_4"]
+    if len(contexts) > 1:
+        merged = copy.deepcopy(cfg)
+        merged_cfg = merged["figures"]["figure_4"]
+        merged_cfg["sample_counts"] = sorted({int(item.loss["figures"]["figure_4"]["sample_counts"]) for item in contexts})
+        merged["_run_seeds"] = sorted({int(item.seed) for item in contexts})
+        return figure_4([Context(seed=seed, loss=merged)])
 
     def first_candidate(value):
         if isinstance(value, list):
@@ -1647,44 +2467,48 @@ def figure_4(plot=False, seed=SEED, config=None):
             return value[0]
         return value
 
-    sample_counts_raw = figure_cfg.get("sample_counts", [10, 20, 30, 40, 50])
+    sample_counts_raw = figure_cfg["sample_counts"]
     if isinstance(sample_counts_raw, list) and sample_counts_raw and isinstance(sample_counts_raw[0], list):
         sample_counts_raw = sample_counts_raw[0]
-    sample_counts = [int(value) for value in sample_counts_raw]
+    sample_counts = [int(value) for value in sample_counts_raw] if isinstance(sample_counts_raw, list) else [int(sample_counts_raw)]
     if not sample_counts:
         raise ValueError("figure_4.sample_counts must not be empty")
-    rounds = int(first_candidate(figure_cfg.get("rounds", 60)))
-    num_rbs = int(first_candidate(figure_cfg.get("num_rbs", 12)))
-    local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
-    batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
-    activation = str(first_candidate(figure_cfg.get("activation", "tanh")))
+    rounds = int(first_candidate(figure_cfg["rounds"]))
+    num_rbs = int(first_candidate(figure_cfg["num_rbs"]))
+    local_epochs = int(first_candidate(figure_cfg["local_epochs"]))
+    activation = str(first_candidate(figure_cfg["activation"]))
     noise_std = 0.4
-    learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["regression_lr"])))
-    eval_batch_size = int(first_candidate(cfg.get("training", {}).get("eval_batch_size", 256)))
-    regression_loss = str(first_candidate(figure_cfg.get("regression_loss", first_candidate(cfg["training"].get("regression_loss", "mse"))))).lower()
+    learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
+    eval_batch_size = int(first_candidate(cfg["training"]["eval_batch_size"]))
+    regression_loss = str(first_candidate(cfg["training"]["regression_loss"])).lower()
+    quantization_bits = int(first_candidate(cfg["training"]["quantization_bits"]))
+    if quantization_bits == 16:
+        compute_dtype = torch.float16
+    elif quantization_bits == 32:
+        compute_dtype = torch.float32
+    elif quantization_bits == 64:
+        compute_dtype = torch.float64
+    else:
+        raise ValueError("training.quantization_bits supports actual compute dtype only for 16, 32, or 64 bits")
     if regression_loss not in {"mse", "nmse"}:
         raise ValueError("regression_loss must be 'mse' or 'nmse'")
     run_config = copy.deepcopy(cfg)
-    run_config.setdefault("training", {})["regression_loss"] = regression_loss
-    average_seeds_raw = figure_cfg.get("average_seeds", [seed])
-    if isinstance(average_seeds_raw, list) and average_seeds_raw and isinstance(average_seeds_raw[0], list):
-        average_seeds_raw = average_seeds_raw[0]
-    average_seeds = [int(value) for value in average_seeds_raw]
-    if not average_seeds:
-        raise ValueError("figure_4.average_seeds must not be empty")
+    run_config["training"]["regression_loss"] = regression_loss
+    run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": []}
     data_seeds_by_seed = {}
     runners = {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b}
-    for average_seed in average_seeds:
-        data_seed_rng = np.random.default_rng(average_seed)
+    for run_seed in run_seeds:
+        # Independent data seeds avoid reusing easier/harder samples across x-values.
+        data_seed_rng = np.random.default_rng(run_seed)
         data_seeds = [int(data_seed_rng.integers(0, 2**32 - 1)) for _ in sample_counts]
-        data_seeds_by_seed[int(average_seed)] = data_seeds
+        data_seeds_by_seed[int(run_seed)] = data_seeds
         seed_curves = {name: [] for name in curves_by_seed}
         for count, data_seed in zip(sample_counts, data_seeds):
             data = generate_synthetic_data(num_users=15, samples_per_user=count, seed=data_seed, noise_std=noise_std)
             train_data = TensorDataset(data["x"], data["y"])
-            torch.manual_seed(average_seed)
+            torch.manual_seed(run_seed)
             initial_model = RegressionFNN(activation=activation)
             initial_state = {name: value.detach().clone() for name, value in initial_model.state_dict().items()}
             for curve_name, runner in runners.items():
@@ -1698,20 +2522,19 @@ def figure_4(plot=False, seed=SEED, config=None):
                     rounds=rounds,
                     num_rbs=num_rbs,
                     local_epochs=local_epochs,
-                    batch_size=batch_size,
                     learning_rate=learning_rate,
-                    seed=average_seed,
+                    seed=run_seed,
                     config=run_config,
                 )
-                fitted = RegressionFNN(activation=activation)
+                fitted = RegressionFNN(activation=activation).to(dtype=compute_dtype)
                 fitted.load_state_dict(output["model_state"])
                 fitted.eval()
                 display_loss = 0.0
                 display_total = 0
                 with torch.no_grad():
                     for features, labels in DataLoader(train_data, batch_size=eval_batch_size, shuffle=False):
-                        prediction = fitted(features)
-                        target = labels.float().reshape_as(prediction)
+                        prediction = fitted(features.to(dtype=compute_dtype))
+                        target = labels.to(dtype=prediction.dtype).reshape_as(prediction)
                         display_loss += float((prediction - target).pow(2).sum().item())
                         display_total += len(features)
                 seed_curves[curve_name].append(display_loss / max(display_total, 1))
@@ -1726,17 +2549,19 @@ def figure_4(plot=False, seed=SEED, config=None):
             "rounds": rounds,
             "num_rbs": num_rbs,
             "local_epochs": local_epochs,
-            "batch_size": batch_size,
+            "optimizer": "full_batch_gradient_descent",
             "activation": activation,
             "noise_std": noise_std,
             "learning_rate": learning_rate,
+            "quantization_bits": quantization_bits,
+            "compute_dtype": str(compute_dtype).replace("torch.", ""),
             "training_loss_function": regression_loss,
             "loss_function": "mse",
             "loss_source": "training_mse_after_training",
             "data_sampling": "independent_per_count",
             "data_seeds_by_seed": data_seeds_by_seed,
-            "average_seeds": average_seeds,
-            "average_runs": len(average_seeds),
+            "seeds": run_seeds,
+            "seed_runs": len(run_seeds),
         },
     }
     if plot:
@@ -1757,9 +2582,20 @@ def figure_4(plot=False, seed=SEED, config=None):
     return result
 
 
-def figure_5(plot=False, seed=SEED, config=None):
-    cfg = load_yaml() if config is None else config
-    figure_cfg = cfg.get("figures", {}).get("figure_5", {})
+def figure_5(contexts):
+    # Fig. 5 measures assignment complexity as user count grows.
+    context = contexts[0]
+    seed = int(context.seed)
+    cfg = context.loss
+    plot = bool(cfg["_plot"])
+    figure_cfg = cfg["figures"]["figure_5"]
+    if len(contexts) > 1:
+        merged = copy.deepcopy(cfg)
+        merged_cfg = merged["figures"]["figure_5"]
+        merged_cfg["user_counts"] = sorted({int(item.loss["figures"]["figure_5"]["user_counts"]) for item in contexts})
+        merged_cfg["rb_counts"] = sorted({int(item.loss["figures"]["figure_5"]["rb_counts"]) for item in contexts})
+        merged["_run_seeds"] = sorted({int(item.seed) for item in contexts})
+        return figure_5([Context(seed=seed, loss=merged)])
 
     def first_candidate(value):
         if isinstance(value, list):
@@ -1768,30 +2604,25 @@ def figure_5(plot=False, seed=SEED, config=None):
             return value[0]
         return value
 
-    users_raw = figure_cfg.get("user_counts", [3, 6, 10, 15, 20, 25])
+    users_raw = figure_cfg["user_counts"]
     if isinstance(users_raw, list) and users_raw and isinstance(users_raw[0], list):
         users_raw = users_raw[0]
-    users = [int(value) for value in users_raw]
-    rb_counts_raw = figure_cfg.get("rb_counts", [10, 15])
+    users = [int(value) for value in users_raw] if isinstance(users_raw, list) else [int(users_raw)]
+    rb_counts_raw = figure_cfg["rb_counts"]
     if isinstance(rb_counts_raw, list) and rb_counts_raw and isinstance(rb_counts_raw[0], list):
         rb_counts_raw = rb_counts_raw[0]
-    rb_counts = [int(value) for value in rb_counts_raw]
-    average_seeds_raw = figure_cfg.get("average_seeds", [seed])
-    if isinstance(average_seeds_raw, list) and average_seeds_raw and isinstance(average_seeds_raw[0], list):
-        average_seeds_raw = average_seeds_raw[0]
-    average_seeds = [int(value) for value in average_seeds_raw]
-    if not average_seeds:
-        raise ValueError("figure_5.average_seeds must not be empty")
+    rb_counts = [int(value) for value in rb_counts_raw] if isinstance(rb_counts_raw, list) else [int(rb_counts_raw)]
+    run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     curves_by_seed = {rb_count: [] for rb_count in rb_counts}
     timings_by_seed = {rb_count: [] for rb_count in rb_counts}
-    for average_seed in average_seeds:
+    for run_seed in run_seeds:
         for rb_count in rb_counts:
             seed_curve = []
             seed_timings = []
             for user_count in users:
                 started = time.perf_counter()
-                output = proposed_algorithm(num_users=user_count, num_rbs=rb_count, seed=average_seed, config=cfg)
+                output = proposed_algorithm(num_users=user_count, num_rbs=rb_count, seed=run_seed, config=cfg)
                 seed_timings.append(time.perf_counter() - started)
                 seed_curve.append(output["solver_iterations"])
             curves_by_seed[rb_count].append(seed_curve)
@@ -1802,7 +2633,7 @@ def figure_5(plot=False, seed=SEED, config=None):
         "users": users,
         "edge_weight_evaluations": curves,
         "seconds": timings,
-        "hyperparameters": {"user_counts": users, "rb_counts": rb_counts, "average_seeds": average_seeds, "average_runs": len(average_seeds)},
+        "hyperparameters": {"user_counts": users, "rb_counts": rb_counts, "seeds": run_seeds, "seed_runs": len(run_seeds)},
     }
     if plot:
         fig, ax = plt.subplots()
@@ -1820,9 +2651,19 @@ def figure_5(plot=False, seed=SEED, config=None):
     return result
 
 
-def figure_6(plot=False, seed=SEED, config=None):
-    cfg = load_yaml() if config is None else config
-    figure_cfg = cfg.get("figures", {}).get("figure_6", {})
+def figure_6(contexts):
+    # Fig. 6 compares Theorem-1 convergence-gap bound with Monte Carlo packet loss.
+    context = contexts[0]
+    seed = int(context.seed)
+    cfg = context.loss
+    plot = bool(cfg["_plot"])
+    figure_cfg = cfg["figures"]["figure_6"]
+    if len(contexts) > 1:
+        merged = copy.deepcopy(cfg)
+        merged_cfg = merged["figures"]["figure_6"]
+        merged_cfg["user_counts"] = sorted({int(item.loss["figures"]["figure_6"]["user_counts"]) for item in contexts})
+        merged["_run_seeds"] = sorted({int(item.seed) for item in contexts})
+        return figure_6([Context(seed=seed, loss=merged)])
     wireless = cfg["wireless"]
     train_cfg = cfg["training"]
 
@@ -1833,28 +2674,28 @@ def figure_6(plot=False, seed=SEED, config=None):
             return value[0]
         return value
 
-    users_raw = figure_cfg.get("user_counts", [3, 6, 9, 12, 15, 18])
+    users_raw = figure_cfg["user_counts"]
     if isinstance(users_raw, list) and users_raw and isinstance(users_raw[0], list):
         users_raw = users_raw[0]
-    users = [int(value) for value in users_raw]
+    users = [int(value) for value in users_raw] if isinstance(users_raw, list) else [int(users_raw)]
     if not users:
         raise ValueError("figure_6.user_counts must not be empty")
-    num_rbs = int(first_candidate(figure_cfg.get("num_rbs", 12)))
-    samples_raw = figure_cfg.get("samples_per_user", wireless["ki_cycle"])
+    num_rbs = int(first_candidate(figure_cfg["num_rbs"]))
+    samples_raw = figure_cfg["samples_per_user"]
     if isinstance(samples_raw, list) and samples_raw and isinstance(samples_raw[0], list):
         samples_raw = samples_raw[0]
     samples_per_user = [int(value) for value in samples_raw]
     if len(samples_per_user) < max(users):
         raise ValueError("figure_6.samples_per_user must contain at least max(user_counts) entries")
-    model_parameters = int(first_candidate(figure_cfg.get("model_parameters", 39760)))
-    quantization_bits = int(first_candidate(figure_cfg.get("quantization_bits", train_cfg.get("quantization_bits", 16))))
-    simulation_trials = int(first_candidate(figure_cfg.get("simulation_trials", 2000)))
-    rounds = int(first_candidate(figure_cfg.get("rounds", 130)))
-    mu = float(first_candidate(figure_cfg.get("strong_convexity_mu", 0.1)))
-    lipschitz = float(first_candidate(figure_cfg.get("lipschitz_l", 1.0)))
-    zeta1 = float(first_candidate(figure_cfg.get("gradient_bound_zeta1", 1.0)))
-    zeta2 = float(first_candidate(figure_cfg.get("gradient_bound_zeta2", 0.5)))
-    threshold = float(first_candidate(figure_cfg.get("waterfall_threshold", wireless["waterfall_threshold"])))
+    model_parameters = int(first_candidate(figure_cfg["model_parameters"]))
+    quantization_bits = int(first_candidate(train_cfg["quantization_bits"]))
+    simulation_trials = int(first_candidate(figure_cfg["simulation_trials"]))
+    rounds = int(first_candidate(figure_cfg["rounds"]))
+    mu = float(first_candidate(figure_cfg["strong_convexity_mu"]))
+    lipschitz = float(first_candidate(figure_cfg["lipschitz_l"]))
+    zeta1 = float(first_candidate(figure_cfg["gradient_bound_zeta1"]))
+    zeta2 = float(first_candidate(figure_cfg["gradient_bound_zeta2"]))
+    threshold = float(first_candidate(figure_cfg["waterfall_threshold"]))
     if simulation_trials <= 0:
         raise ValueError("figure_6.simulation_trials must be positive")
     if rounds <= 0:
@@ -1862,7 +2703,7 @@ def figure_6(plot=False, seed=SEED, config=None):
     if mu <= 0.0 or lipschitz <= 0.0:
         raise ValueError("figure_6 strong_convexity_mu and lipschitz_l must be positive")
 
-    interference_by_rbs = wireless.get("interference_w_by_rbs", {})
+    interference_by_rbs = wireless["interference_w_by_rbs"]
     interference_profile = interference_by_rbs.get(str(num_rbs)) if isinstance(interference_by_rbs, dict) else None
     if interference_profile is None and isinstance(interference_by_rbs, dict):
         interference_profile = interference_by_rbs.get(num_rbs)
@@ -1886,14 +2727,10 @@ def figure_6(plot=False, seed=SEED, config=None):
     )
     delay_requirement = float(wireless["delay_s"])
     energy_requirement = float(wireless["energy_j"])
-    average_seeds_raw = figure_cfg.get("average_seeds", [seed])
-    if isinstance(average_seeds_raw, list) and average_seeds_raw and isinstance(average_seeds_raw[0], list):
-        average_seeds_raw = average_seeds_raw[0]
-    average_seeds = [int(value) for value in average_seeds_raw]
-    if not average_seeds:
-        raise ValueError("figure_6.average_seeds must not be empty")
+    run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     def simulate_packet_error_bound(counts, selected_user_ids, selected_error_values, packet_rng):
+        # This simulates only the wireless-miss term in Theorem 1, not full MNIST training.
         total = float(np.sum(counts))
         selected_user_ids = np.asarray(selected_user_ids, dtype=np.int64)
         selected_error_values = np.asarray(selected_error_values, dtype=np.float64)
@@ -1918,8 +2755,8 @@ def figure_6(plot=False, seed=SEED, config=None):
     bound_simulated_by_seed = []
     selected_by_seed = []
     miss_ratio_by_seed = []
-    for average_seed in average_seeds:
-        rng = np.random.default_rng(average_seed)
+    for run_seed in run_seeds:
+        rng = np.random.default_rng(run_seed)
         distance_pool = np.maximum(rng.random(max(users)) * radius, np.finfo(np.float64).tiny)
         theoretical_seed = []
         bound_simulated_seed = []
@@ -1959,7 +2796,7 @@ def figure_6(plot=False, seed=SEED, config=None):
             theoretical_seed.append(gap)
             selected_seed.append(len(selected_users))
             miss_ratio_seed.append(miss_ratio)
-            packet_rng = np.random.default_rng(average_seed * 1000003 + user_count * 7919 + 101)
+            packet_rng = np.random.default_rng(run_seed * 1000003 + user_count * 7919 + 101)
             bound_simulated_seed.append(simulate_packet_error_bound(counts, selected_users_array, selected_errors, packet_rng))
         theoretical_by_seed.append(theoretical_seed)
         bound_simulated_by_seed.append(bound_simulated_seed)
@@ -1988,8 +2825,8 @@ def figure_6(plot=False, seed=SEED, config=None):
             "lipschitz_l": lipschitz,
             "gradient_bound_zeta1": zeta1,
             "gradient_bound_zeta2": zeta2,
-            "average_seeds": average_seeds,
-            "average_runs": len(average_seeds),
+            "seeds": run_seeds,
+            "seed_runs": len(run_seeds),
             "wireless_model": "docs/Wireless-FL/FLMIN.m",
         },
     }
@@ -2000,15 +2837,24 @@ def figure_6(plot=False, seed=SEED, config=None):
         ax.set_xlabel("Number of users")
         ax.set_ylabel("Convergence gap due to wireless factors")
         ax.set_xticks(users)
-        ax.set_yticks(np.arange(0, math.ceil(max(max(theoretical), max(simulated)) / 5) * 5 + 5, 5))
-        ax.legend()
+        ax.legend(loc="upper left")
         result["figure"] = fig
     return result
 
 
-def figure_7(plot=False, seed=SEED, rounds=130, config=None):
-    cfg = load_yaml() if config is None else config
-    figure_cfg = cfg.get("figures", {}).get("figure_7", {})
+def figure_7(contexts):
+    # Fig. 7 tracks MNIST identification accuracy over FL communication rounds.
+    context = contexts[0]
+    seed = int(context.seed)
+    cfg = context.loss
+    plot = bool(cfg["_plot"])
+    figure_cfg = cfg["figures"]["figure_7"]
+    if len(contexts) > 1:
+        merged = copy.deepcopy(cfg)
+        merged_cfg = merged["figures"]["figure_7"]
+        merged_cfg["rounds"] = max(int(item.loss["figures"]["figure_7"]["rounds"]) for item in contexts)
+        merged["_run_seeds"] = sorted({int(item.seed) for item in contexts})
+        return figure_7([Context(seed=seed, loss=merged)])
 
     def first_candidate(value):
         if isinstance(value, list):
@@ -2017,28 +2863,41 @@ def figure_7(plot=False, seed=SEED, rounds=130, config=None):
             return value[0]
         return value
 
-    samples_raw = figure_cfg.get("samples_per_user", [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100])
+    samples_raw = figure_cfg["samples_per_user"]
     if isinstance(samples_raw, list) and samples_raw and isinstance(samples_raw[0], list):
         samples_raw = samples_raw[0]
     samples_per_user = [int(value) for value in samples_raw]
     num_users = len(samples_per_user)
-    test_samples = int(first_candidate(figure_cfg.get("test_samples", 1000)))
-    rounds = int(first_candidate(figure_cfg.get("rounds", rounds)))
-    num_rbs = int(first_candidate(figure_cfg.get("num_rbs", 12)))
-    local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
-    batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
-    learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["mnist_lr"])))
-    average_seeds_raw = figure_cfg.get("average_seeds", [seed])
-    if isinstance(average_seeds_raw, list) and average_seeds_raw and isinstance(average_seeds_raw[0], list):
-        average_seeds_raw = average_seeds_raw[0]
-    average_seeds = [int(value) for value in average_seeds_raw]
-    if not average_seeds:
-        raise ValueError("figure_7.average_seeds must not be empty")
+    test_samples = int(first_candidate(figure_cfg["test_samples"]))
+    rounds = int(first_candidate(figure_cfg["rounds"]))
+    num_rbs = int(first_candidate(figure_cfg["num_rbs"]))
+    local_epochs = int(first_candidate(figure_cfg["local_epochs"]))
+    learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
+    quantization_bits = int(first_candidate(cfg["training"]["quantization_bits"]))
+    if quantization_bits == 16:
+        compute_dtype = torch.float16
+    elif quantization_bits == 32:
+        compute_dtype = torch.float32
+    elif quantization_bits == 64:
+        compute_dtype = torch.float64
+    else:
+        raise ValueError("training.quantization_bits supports actual compute dtype only for 16, 32, or 64 bits")
+    optimizer_name = str(cfg["training"].get("optimizer", "gradient_descent")).lower().replace("-", "_")
+    if optimizer_name in {"gd", "full_batch_gradient_descent"}:
+        optimizer_name = "gradient_descent"
+    run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     curves = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
     runners = {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b, "baseline_c": baseline_c}
-    for average_seed in average_seeds:
-        data = load_mnist_data(num_users=num_users, samples_per_user=samples_per_user, test_samples=test_samples, seed=average_seed)
+    for run_seed in run_seeds:
+        data = load_mnist_data(
+            num_users=num_users,
+            samples_per_user=samples_per_user,
+            test_samples=test_samples,
+            seed=run_seed,
+            train_order=cfg["training"]["mnist_train_order"],
+            partition_order=cfg["training"]["mnist_partition_order"],
+        )
         for name, runner in runners.items():
             output = runner(
                 data["users"],
@@ -2048,27 +2907,51 @@ def figure_7(plot=False, seed=SEED, rounds=130, config=None):
                 rounds=rounds,
                 num_rbs=num_rbs,
                 local_epochs=local_epochs,
-                batch_size=batch_size,
                 learning_rate=learning_rate,
-                seed=average_seed,
+                seed=run_seed,
                 config=cfg,
             )
             curves[name].append(output["metrics"]["accuracy"])
     curves = {name: np.mean(values, axis=0).tolist() for name, values in curves.items()}
+    hyperparameters = {
+        "samples_per_user": samples_per_user,
+        "test_samples": test_samples,
+        "rounds": rounds,
+        "num_rbs": num_rbs,
+        "local_epochs": local_epochs,
+        "optimizer": optimizer_name,
+        "learning_rate": learning_rate,
+        "quantization_bits": quantization_bits,
+        "compute_dtype": str(compute_dtype).replace("torch.", ""),
+        "seeds": run_seeds,
+        "seed_runs": len(run_seeds),
+        "baseline_c_mode": cfg["training"]["baseline_c_mode"],
+    }
+    if optimizer_name == "adam":
+        hyperparameters.update(
+            {
+                "adam_beta1": float(cfg["training"]["adam_beta1"]),
+                "adam_beta2": float(cfg["training"]["adam_beta2"]),
+                "adam_eps": float(cfg["training"]["adam_eps"]),
+                "adam_weight_decay": float(cfg["training"]["adam_weight_decay"]),
+                "adam_persistent_state": bool(cfg["training"]["adam_persistent_state"]),
+            }
+        )
+    if optimizer_name == "lbfgs":
+        hyperparameters.update(
+            {
+                "lbfgs_max_iter": int(cfg["training"]["lbfgs_max_iter"]),
+                "lbfgs_max_eval": int(cfg["training"]["lbfgs_max_eval"]),
+                "lbfgs_tolerance_grad": float(cfg["training"]["lbfgs_tolerance_grad"]),
+                "lbfgs_tolerance_change": float(cfg["training"]["lbfgs_tolerance_change"]),
+                "lbfgs_history_size": int(cfg["training"]["lbfgs_history_size"]),
+                "lbfgs_line_search_fn": cfg["training"]["lbfgs_line_search_fn"],
+            }
+        )
     result = {
         "rounds": list(range(1, rounds + 1)),
         "accuracy": curves,
-        "hyperparameters": {
-            "samples_per_user": samples_per_user,
-            "test_samples": test_samples,
-            "rounds": rounds,
-            "num_rbs": num_rbs,
-            "local_epochs": local_epochs,
-            "batch_size": batch_size,
-            "learning_rate": learning_rate,
-            "average_seeds": average_seeds,
-            "average_runs": len(average_seeds),
-        },
+        "hyperparameters": hyperparameters,
     }
     if plot:
         fig, ax = plt.subplots()
@@ -2089,9 +2972,19 @@ def figure_7(plot=False, seed=SEED, rounds=130, config=None):
     return result
 
 
-def figure_8(plot=False, seed=SEED, config=None):
-    cfg = load_yaml() if config is None else config
-    figure_cfg = cfg.get("figures", {}).get("figure_8", {})
+def figure_8(contexts):
+    # Fig. 8 varies total users while keeping RBs fixed.
+    context = contexts[0]
+    seed = int(context.seed)
+    cfg = context.loss
+    plot = bool(cfg["_plot"])
+    figure_cfg = cfg["figures"]["figure_8"]
+    if len(contexts) > 1:
+        merged = copy.deepcopy(cfg)
+        merged_cfg = merged["figures"]["figure_8"]
+        merged_cfg["user_counts"] = sorted({int(item.loss["figures"]["figure_8"]["user_counts"]) for item in contexts})
+        merged["_run_seeds"] = sorted({int(item.seed) for item in contexts})
+        return figure_8([Context(seed=seed, loss=merged)])
 
     def first_candidate(value):
         if isinstance(value, list):
@@ -2100,38 +2993,46 @@ def figure_8(plot=False, seed=SEED, config=None):
             return value[0]
         return value
 
-    user_counts_raw = figure_cfg.get("user_counts", [3, 6, 9, 12, 15, 18])
+    user_counts_raw = figure_cfg["user_counts"]
     if isinstance(user_counts_raw, list) and user_counts_raw and isinstance(user_counts_raw[0], list):
         user_counts_raw = user_counts_raw[0]
-    user_counts = [int(value) for value in user_counts_raw]
-    samples_raw = figure_cfg.get("samples_per_user", [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100, 200, 300, 400])
+    user_counts = [int(value) for value in user_counts_raw] if isinstance(user_counts_raw, list) else [int(user_counts_raw)]
+    samples_raw = figure_cfg["samples_per_user"]
     if isinstance(samples_raw, list) and samples_raw and isinstance(samples_raw[0], list):
         samples_raw = samples_raw[0]
     sample_pool = [int(value) for value in samples_raw]
     if max(user_counts) > len(sample_pool):
         raise ValueError("figure_8.samples_per_user must cover the largest figure_8.user_counts value")
-    test_samples = int(first_candidate(figure_cfg.get("test_samples", 1000)))
-    rounds = int(first_candidate(figure_cfg.get("rounds", 130)))
-    num_rbs = int(first_candidate(figure_cfg.get("num_rbs", 12)))
-    local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
-    batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
-    learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["mnist_lr"])))
-    average_seeds_raw = figure_cfg.get("average_seeds", [seed])
-    if isinstance(average_seeds_raw, list) and average_seeds_raw and isinstance(average_seeds_raw[0], list):
-        average_seeds_raw = average_seeds_raw[0]
-    average_seeds = [int(value) for value in average_seeds_raw]
-    if not average_seeds:
-        raise ValueError("figure_8.average_seeds must not be empty")
+    test_samples = int(first_candidate(figure_cfg["test_samples"]))
+    rounds = int(first_candidate(figure_cfg["rounds"]))
+    num_rbs = int(first_candidate(figure_cfg["num_rbs"]))
+    local_epochs = int(first_candidate(figure_cfg["local_epochs"]))
+    learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
+    run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
     runners = {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b, "baseline_c": baseline_c}
-    for average_seed in average_seeds:
-        shared = load_mnist_data(num_users=max(user_counts), samples_per_user=sample_pool[:max(user_counts)], test_samples=test_samples, seed=average_seed)
+    for run_seed in run_seeds:
+        shared = load_mnist_data(
+            num_users=max(user_counts),
+            samples_per_user=sample_pool[:max(user_counts)],
+            test_samples=test_samples,
+            seed=run_seed,
+            train_order=cfg["training"]["mnist_train_order"],
+            partition_order=cfg["training"]["mnist_partition_order"],
+        )
         test_data = shared["test"]
         seed_curves = {name: [] for name in curves_by_seed}
         for user_count in user_counts:
             samples = sample_pool[:user_count]
-            data = load_mnist_data(num_users=user_count, samples_per_user=samples, test_samples=test_samples, seed=average_seed)
+            data = load_mnist_data(
+                num_users=user_count,
+                samples_per_user=samples,
+                test_samples=test_samples,
+                seed=run_seed,
+                train_order=cfg["training"]["mnist_train_order"],
+                partition_order=cfg["training"]["mnist_partition_order"],
+            )
             for name, runner in runners.items():
                 output = runner(
                     data["users"],
@@ -2141,9 +3042,8 @@ def figure_8(plot=False, seed=SEED, config=None):
                     rounds=rounds,
                     num_rbs=num_rbs,
                     local_epochs=local_epochs,
-                    batch_size=batch_size,
                     learning_rate=learning_rate,
-                    seed=average_seed,
+                    seed=run_seed,
                     config=cfg,
                 )
                 seed_curves[name].append(output["metrics"]["accuracy"][-1])
@@ -2160,10 +3060,11 @@ def figure_8(plot=False, seed=SEED, config=None):
             "rounds": rounds,
             "num_rbs": num_rbs,
             "local_epochs": local_epochs,
-            "batch_size": batch_size,
+            "optimizer": "full_batch_gradient_descent",
             "learning_rate": learning_rate,
-            "average_seeds": average_seeds,
-            "average_runs": len(average_seeds),
+            "seeds": run_seeds,
+            "seed_runs": len(run_seeds),
+            "baseline_c_mode": cfg["training"]["baseline_c_mode"],
         },
     }
     if plot:
@@ -2186,9 +3087,19 @@ def figure_8(plot=False, seed=SEED, config=None):
     return result
 
 
-def figure_9(plot=False, seed=SEED, config=None):
-    cfg = load_yaml() if config is None else config
-    figure_cfg = cfg.get("figures", {}).get("figure_9", {})
+def figure_9(contexts):
+    # Fig. 9 varies the number of uplink RBs for a fixed MNIST user pool.
+    context = contexts[0]
+    seed = int(context.seed)
+    cfg = context.loss
+    plot = bool(cfg["_plot"])
+    figure_cfg = cfg["figures"]["figure_9"]
+    if len(contexts) > 1:
+        merged = copy.deepcopy(cfg)
+        merged_cfg = merged["figures"]["figure_9"]
+        merged_cfg["rb_counts"] = sorted({int(item.loss["figures"]["figure_9"]["rb_counts"]) for item in contexts})
+        merged["_run_seeds"] = sorted({int(item.seed) for item in contexts})
+        return figure_9([Context(seed=seed, loss=merged)])
 
     def first_candidate(value):
         if isinstance(value, list):
@@ -2197,33 +3108,38 @@ def figure_9(plot=False, seed=SEED, config=None):
             return value[0]
         return value
 
-    rb_counts_raw = figure_cfg.get("rb_counts", [3, 6, 9, 12])
+    rb_counts_raw = figure_cfg["rb_counts"]
     if isinstance(rb_counts_raw, list) and rb_counts_raw and isinstance(rb_counts_raw[0], list):
         rb_counts_raw = rb_counts_raw[0]
-    rb_counts = [int(value) for value in rb_counts_raw]
-    samples_raw = figure_cfg.get("samples_per_user", [100, 200, 300, 400, 500, 400, 300, 200, 100, 200, 300, 400, 500, 600, 100])
+    rb_counts = [int(value) for value in rb_counts_raw] if isinstance(rb_counts_raw, list) else [int(rb_counts_raw)]
+    samples_raw = figure_cfg["samples_per_user"]
     if isinstance(samples_raw, list) and samples_raw and isinstance(samples_raw[0], list):
         samples_raw = samples_raw[0]
     samples_per_user = [int(value) for value in samples_raw]
-    test_samples = int(first_candidate(figure_cfg.get("test_samples", 1000)))
-    rounds = int(first_candidate(figure_cfg.get("rounds", 130)))
-    local_epochs = int(first_candidate(figure_cfg.get("local_epochs", 1)))
-    batch_size = int(first_candidate(figure_cfg.get("batch_size", 32)))
-    learning_rate = float(first_candidate(figure_cfg.get("learning_rate", cfg["training"]["mnist_lr"])))
-    average_seeds_raw = figure_cfg.get("average_seeds", [seed])
-    if isinstance(average_seeds_raw, list) and average_seeds_raw and isinstance(average_seeds_raw[0], list):
-        average_seeds_raw = average_seeds_raw[0]
-    average_seeds = [int(value) for value in average_seeds_raw]
-    if not average_seeds:
-        raise ValueError("figure_9.average_seeds must not be empty")
+    test_samples = int(first_candidate(figure_cfg["test_samples"]))
+    rounds = int(first_candidate(figure_cfg["rounds"]))
+    local_epochs = int(first_candidate(figure_cfg["local_epochs"]))
+    learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
+    runner_seed_mode = str(first_candidate(figure_cfg["runner_seed_mode"])).lower()
+    if runner_seed_mode not in {"same", "rb_offset"}:
+        raise ValueError("figure_9.runner_seed_mode must be 'same' or 'rb_offset'")
+    run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
     runners = {"proposed": proposed_algorithm, "baseline_a": baseline_a, "baseline_b": baseline_b, "baseline_c": baseline_c}
-    for average_seed in average_seeds:
-        data = load_mnist_data(num_users=len(samples_per_user), samples_per_user=samples_per_user, test_samples=test_samples, seed=average_seed)
+    for run_seed in run_seeds:
+        data = load_mnist_data(
+            num_users=len(samples_per_user),
+            samples_per_user=samples_per_user,
+            test_samples=test_samples,
+            seed=run_seed,
+            train_order=cfg["training"]["mnist_train_order"],
+            partition_order=cfg["training"]["mnist_partition_order"],
+        )
         seed_curves = {name: [] for name in curves_by_seed}
         for rb_count in rb_counts:
             for name, runner in runners.items():
+                runner_seed = run_seed if runner_seed_mode == "same" else run_seed * 1009 + int(rb_count)
                 output = runner(
                     data["users"],
                     MNISTFNN,
@@ -2232,9 +3148,8 @@ def figure_9(plot=False, seed=SEED, config=None):
                     rounds=rounds,
                     num_rbs=rb_count,
                     local_epochs=local_epochs,
-                    batch_size=batch_size,
                     learning_rate=learning_rate,
-                    seed=average_seed,
+                    seed=runner_seed,
                     config=cfg,
                 )
                 seed_curves[name].append(output["metrics"]["accuracy"][-1])
@@ -2250,10 +3165,19 @@ def figure_9(plot=False, seed=SEED, config=None):
             "test_samples": test_samples,
             "rounds": rounds,
             "local_epochs": local_epochs,
-            "batch_size": batch_size,
+            "optimizer": "full_batch_gradient_descent",
             "learning_rate": learning_rate,
-            "average_seeds": average_seeds,
-            "average_runs": len(average_seeds),
+            "runner_seed_mode": runner_seed_mode,
+            "seeds": run_seeds,
+            "seed_runs": len(run_seeds),
+            "baseline_c_mode": cfg["training"]["baseline_c_mode"],
+            "baseline_c_assignment": "wireless_fl_munkres_then_random_rb" if str(cfg["training"]["baseline_c_mode"]).lower() == "wireless_fl" else "ki_agnostic_hungarian",
+            "baseline_c_aggregation": "fedavg",
+            "channel_model": cfg["wireless"]["channel_model"],
+            "mnist_activation": cfg["training"]["mnist_activation"],
+            "mnist_train_order": cfg["training"]["mnist_train_order"],
+            "mnist_partition_order": cfg["training"]["mnist_partition_order"],
+            "force_first_round_success": cfg["training"]["force_first_round_success"],
         },
     }
     if plot:
@@ -2276,16 +3200,80 @@ def figure_9(plot=False, seed=SEED, config=None):
     return result
 
 
-def figure_10(plot=False, seed=SEED, config=None):
-    data = load_mnist_data(num_users=15, samples_per_user=300, test_samples=36, seed=seed)
-    proposed = proposed_algorithm(data["users"], MNISTCNN, task="mnist", test_data=data["test"], rounds=8, num_rbs=12, seed=seed, batch_size=32, config=config)
-    baseline = baseline_b(data["users"], MNISTCNN, task="mnist", test_data=data["test"], rounds=8, num_rbs=12, seed=seed, batch_size=32, config=config)
+def figure_10(contexts):
+    # Fig. 10 uses CNN predictions on a 6x6 MNIST sample grid.
+    context = contexts[0]
+    seed = int(context.seed)
+    cfg = context.loss
+    plot = bool(cfg["_plot"])
+    figure_cfg = cfg["figures"]["figure_10"]
+
+    def first_candidate(value):
+        if isinstance(value, list):
+            if not value:
+                raise ValueError("Figure configuration candidate lists must not be empty")
+            return value[0]
+        return value
+
+    samples_per_user = int(first_candidate(figure_cfg["samples_per_user"]))
+    test_samples = int(first_candidate(figure_cfg["test_samples"]))
+    rounds = int(first_candidate(figure_cfg["rounds"]))
+    num_rbs = int(first_candidate(figure_cfg["num_rbs"]))
+    local_epochs = int(first_candidate(figure_cfg["local_epochs"]))
+    learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
+    data = load_mnist_data(
+        num_users=15,
+        samples_per_user=samples_per_user,
+        test_samples=test_samples,
+        seed=seed,
+        train_order=cfg["training"]["mnist_train_order"],
+        partition_order=cfg["training"]["mnist_partition_order"],
+    )
+    torch.manual_seed(seed)
+    initial_model = MNISTCNN()
+    initial_state = {name: value.detach().clone() for name, value in initial_model.state_dict().items()}
+    proposed_model = MNISTCNN()
+    proposed_model.load_state_dict(copy.deepcopy(initial_state))
+    baseline_model = MNISTCNN()
+    baseline_model.load_state_dict(copy.deepcopy(initial_state))
+    proposed = proposed_algorithm(
+        data["users"],
+        proposed_model,
+        task="mnist",
+        test_data=data["test"],
+        rounds=rounds,
+        num_rbs=num_rbs,
+        local_epochs=local_epochs,
+        learning_rate=learning_rate,
+        seed=seed,
+        config=cfg,
+    )
+    baseline = baseline_b(
+        data["users"],
+        baseline_model,
+        task="mnist",
+        test_data=data["test"],
+        rounds=rounds,
+        num_rbs=num_rbs,
+        local_epochs=local_epochs,
+        learning_rate=learning_rate,
+        seed=seed,
+        config=cfg,
+    )
     result = {
         "proposed_accuracy": proposed["metrics"]["accuracy"][-1],
         "baseline_b_accuracy": baseline["metrics"]["accuracy"][-1],
         "proposed_correct": int(round(proposed["metrics"]["accuracy"][-1] * len(data["test"]))),
         "baseline_b_correct": int(round(baseline["metrics"]["accuracy"][-1] * len(data["test"]))),
         "n_examples": len(data["test"]),
+        "hyperparameters": {
+            "samples_per_user": samples_per_user,
+            "test_samples": test_samples,
+            "rounds": rounds,
+            "num_rbs": num_rbs,
+            "local_epochs": local_epochs,
+            "learning_rate": learning_rate,
+        },
     }
     if plot:
         images, labels = data["test"].tensors
@@ -2316,17 +3304,16 @@ def figure_10(plot=False, seed=SEED, config=None):
 
 # main
 def main():
+    # CLI entry point for paper figure reproduction and YAML sweeps.
     parser = argparse.ArgumentParser(description="Reproduce FL over wireless network experiments from Chen et al. TWC 2021.")
     parser.add_argument("--figure", choices=["3", "4", "5", "6", "7", "8", "9", "10", "all"], default="all")
     parser.add_argument("--config", default=None)
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--verbose", action="store_true", help="Write detailed per-round FL training diagnostics to OUTPUT_DIR/verbose_logs/*.txt.")
     args = parser.parse_args()
 
-    config = load_yaml(args.config) if args.config else load_yaml()
-    if args.seed is not None:
-        config["seed"] = args.seed
     plt.rcParams.update(
         {
             "axes.edgecolor": "black",
@@ -2352,86 +3339,30 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    def candidate_values(key, value):
-        if not isinstance(value, list):
-            return [value]
-        if key.endswith("sample_counts") and (not value or not isinstance(value[0], list)):
-            return [value]
-        if key.endswith("samples_per_user") and (not value or not isinstance(value[0], list)):
-            return [value]
-        if key.endswith("user_counts") and (not value or not isinstance(value[0], list)):
-            return [value]
-        if key.endswith("rb_counts") and (not value or not isinstance(value[0], list)):
-            return [value]
-        if key.endswith("average_seeds") and (not value or not isinstance(value[0], list)):
-            return [value]
-        if key.endswith("ki_cycle") and (not value or not isinstance(value[0], list)):
-            return [value]
-        if not value:
-            raise ValueError(f"{key} must not be an empty list")
-        return value
-
-    def figure_runs(name):
-        figure_key = f"figure_{name}"
-        figure_config = config.get("figures", {}).get(figure_key, {})
-        seed_source = config.get("seed", SEED)
-        seed_values = candidate_values("seed", seed_source)
-        run_values = []
-        for seed_value in seed_values:
-            filename_settings = {"seed": int(seed_value)} if isinstance(seed_source, list) else {}
-            varied = {"seed": int(seed_value)} if len(seed_values) > 1 else {}
-            run_values.append(({}, varied, filename_settings, int(seed_value)))
-        for section_name in ("wireless", "training"):
-            section_config = config.get(section_name, {})
-            for key, value in section_config.items():
-                composite_key = f"{section_name}.{key}"
-                values = candidate_values(composite_key, value)
-                next_run_values = []
-                for existing, varied, filename_settings, seed_value in run_values:
-                    for candidate in values:
-                        updated = dict(existing)
-                        updated[composite_key] = candidate
-                        updated_varied = dict(varied)
-                        if len(values) > 1:
-                            updated_varied[composite_key] = candidate
-                        updated_filename_settings = dict(filename_settings)
-                        if len(values) > 1:
-                            updated_filename_settings[composite_key] = candidate
-                        next_run_values.append((updated, updated_varied, updated_filename_settings, seed_value))
-                run_values = next_run_values
-        for key, value in figure_config.items():
-            values = candidate_values(key, value)
-            next_run_values = []
-            for existing, varied, filename_settings, seed_value in run_values:
-                for candidate in values:
-                    updated = dict(existing)
-                    updated[key] = candidate
-                    updated_varied = dict(varied)
-                    if len(values) > 1:
-                        updated_varied[key] = candidate
-                    updated_filename_settings = dict(filename_settings)
-                    if isinstance(value, list):
-                        updated_filename_settings[key] = candidate
-                    next_run_values.append((updated, updated_varied, updated_filename_settings, seed_value))
-            run_values = next_run_values
-
-        runs = []
-        for values, varied, filename_settings, seed_value in run_values:
-            run_config = copy.deepcopy(config)
-            run_config.setdefault("figures", {}).setdefault(figure_key, {})
-            figure_values = {}
-            for key, value in values.items():
-                if "." in key:
-                    section_name, section_key = key.split(".", 1)
-                    run_config.setdefault(section_name, {})[section_key] = value
-                else:
-                    figure_values[key] = value
-            run_config["figures"][figure_key].update(figure_values)
-            run_config["seed"] = seed_value
-            runs.append((run_config, varied, filename_settings))
-        return runs or [(copy.deepcopy(config), {}, {})]
+    def contexts_for_figure(name):
+        config_path = Path(args.config) if args.config is not None else Path("configs") / f"figure_{name}.yaml"
+        contexts = [context for context in build_contexts(config_path) if context.loss["_figure"] == name]
+        if not contexts:
+            raise ValueError(f"{config_path} did not define figure_{name}")
+        verbose_log_path = output_dir / "verbose_logs" / f"figure_{name}.txt"
+        if args.verbose:
+            verbose_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(verbose_log_path, "w", encoding="utf-8") as handle:
+                handle.write(f"figure={name}\nconfig={config_path}\n")
+        for context in contexts:
+            if args.seed is not None:
+                context.seed = args.seed
+                context.loss["seed"] = args.seed
+                context.loss["_run_seeds"] = [args.seed]
+                context.loss["_filename_settings"]["seed"] = args.seed
+                context.loss["_varied"]["seed"] = args.seed
+            context.loss["_plot"] = True
+            context.loss["_verbose"] = bool(args.verbose)
+            context.loss["_verbose_log_path"] = str(verbose_log_path)
+        return contexts
 
     def value_token(value):
+        # Stable filename tokens make output sweeps traceable.
         if isinstance(value, list):
             raw = "_".join(str(item) for item in value)
         else:
@@ -2457,6 +3388,7 @@ def main():
         return token
 
     def format_figure(fig, name):
+        # Apply a paper-like black-axis/grid style after each figure builds its data.
         for ax in fig.axes:
             if name != "10":
                 ax.grid(True, color="#d9d9d9", linewidth=0.8, alpha=0.8)
@@ -2475,49 +3407,45 @@ def main():
         else:
             fig.tight_layout()
 
-    planned = {name: figure_runs(name) for name in selected}
-    total_runs = sum(len(runs) for runs in planned.values())
+    planned = {name: contexts_for_figure(name) for name in selected}
+    total_runs = sum(len(contexts) for contexts in planned.values())
     print(f"planned_runs: {total_runs}")
     if total_runs >= 100:
         print(f"warning: YAML expands to {total_runs} runs; narrow candidate lists if this is unintended.")
 
     for name, func in selected.items():
-        runs = planned[name]
-        for run_index, (run_config, varied, filename_settings) in enumerate(runs, start=1):
-            run_seed = int(run_config.get("seed", SEED))
-            result = func(plot=True, seed=run_seed, config=run_config)
-            save_path = None
-            if "figure" in result:
-                fig = result["figure"]
-                format_figure(fig, name)
-                save_dir = output_dir / f"figure_{name}"
-                save_dir.mkdir(parents=True, exist_ok=True)
-                save_path = save_dir / f"{run_index:03d}_{run_token(filename_settings)}.png"
-                fig.savefig(save_path, dpi=200, bbox_inches="tight")
-                plt.close(fig)
+        contexts = planned[name]
+        result = func(contexts)
+        save_path = None
+        if "figure" in result:
+            fig = result["figure"]
+            format_figure(fig, name)
+            save_dir = output_dir / f"figure_{name}"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            save_path = save_dir / f"001_contexts_{len(contexts)}.png"
+            fig.savefig(save_path, dpi=200, bbox_inches="tight")
+            plt.close(fig)
 
-            printable = {}
-            for key, value in result.items():
-                if key == "figure":
-                    continue
-                if isinstance(value, np.ndarray):
-                    printable[key] = {"shape": value.shape, "first": float(value.ravel()[0]) if value.size else None}
-                elif isinstance(value, tuple) and value and all(isinstance(item, np.ndarray) for item in value):
-                    printable[key] = [{"shape": item.shape, "first": float(item.ravel()[0]) if item.size else None} for item in value]
-                elif isinstance(value, dict):
-                    printable[key] = {}
-                    for subkey, subvalue in value.items():
-                        if key == "loss" and isinstance(subvalue, list) and subvalue:
-                            printable[key][subkey] = subvalue[-1]
-                        else:
-                            printable[key][subkey] = subvalue
-                else:
-                    printable[key] = value
-            if varied:
-                printable["sweep"] = varied
-            print(f"figure_{name} run {run_index}/{len(runs)}: {printable}")
-            if save_path is not None:
-                print(f"saved: {save_path}")
+        printable = {"context_count": len(contexts)}
+        for key, value in result.items():
+            if key == "figure":
+                continue
+            if isinstance(value, np.ndarray):
+                printable[key] = {"shape": value.shape, "first": float(value.ravel()[0]) if value.size else None}
+            elif isinstance(value, tuple) and value and all(isinstance(item, np.ndarray) for item in value):
+                printable[key] = [{"shape": item.shape, "first": float(item.ravel()[0]) if item.size else None} for item in value]
+            elif isinstance(value, dict):
+                printable[key] = {}
+                for subkey, subvalue in value.items():
+                    if key == "loss" and isinstance(subvalue, list) and subvalue:
+                        printable[key][subkey] = subvalue[-1]
+                    else:
+                        printable[key][subkey] = subvalue
+            else:
+                printable[key] = value
+        print(f"figure_{name}: {printable}")
+        if save_path is not None:
+            print(f"saved: {save_path}")
 
 
 if __name__ == "__main__":
