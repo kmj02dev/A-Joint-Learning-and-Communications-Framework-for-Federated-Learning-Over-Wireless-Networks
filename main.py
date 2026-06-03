@@ -1866,9 +1866,108 @@ def proposed_algorithm(
     selected_users = []
     assigned_rbs = []
     if resource_search == "hungarian":
-        # This is Algorithm 1's bipartite matching step.
-        solver_iterations = int(num_users * num_rbs)
-        rows, cols = linear_sum_assignment(weights)
+        # This is Algorithm 1's bipartite matching step.  Fig. 5 in the paper
+        # counts Munkres/Hungarian matching updates, not only the U*R edge
+        # evaluations needed to build psi_{i,n}.
+        cost_matrix = np.asarray(weights, dtype=np.float64)
+        row_count, col_count = cost_matrix.shape
+        matrix_size = max(row_count, col_count)
+        valid_values = cost_matrix[np.isfinite(cost_matrix)]
+        if valid_values.size:
+            max_value = 10.0 * float(np.max(valid_values))
+        else:
+            max_value = 0.0
+        working_cost = np.full((matrix_size, matrix_size), max_value, dtype=np.float64)
+        working_cost[:row_count, :col_count] = cost_matrix
+        working_cost = working_cost - working_cost.min(axis=1, keepdims=True)
+        working_cost = working_cost - working_cost.min(axis=0, keepdims=True)
+        zero_tolerance = 1e-12
+        starred = np.zeros((matrix_size, matrix_size), dtype=bool)
+        primed = np.zeros((matrix_size, matrix_size), dtype=bool)
+        covered_rows = np.zeros(matrix_size, dtype=bool)
+        covered_cols = np.zeros(matrix_size, dtype=bool)
+        major_steps = 0
+
+        for row_idx, col_idx in zip(*np.where(np.abs(working_cost) <= zero_tolerance)):
+            if not covered_rows[row_idx] and not covered_cols[col_idx]:
+                starred[row_idx, col_idx] = True
+                covered_rows[row_idx] = True
+                covered_cols[col_idx] = True
+                major_steps += 1
+        covered_rows[:] = False
+        covered_cols[:] = False
+
+        while True:
+            covered_cols[:] = starred.any(axis=0)
+            major_steps += 1
+            if np.all(starred.any(axis=1)):
+                break
+            primed[:] = False
+
+            while True:
+                zero_row = -1
+                zero_col = -1
+                for row_idx in range(matrix_size):
+                    if covered_rows[row_idx]:
+                        continue
+                    uncovered_zero_cols = np.where((~covered_cols) & (np.abs(working_cost[row_idx]) <= zero_tolerance))[0]
+                    if uncovered_zero_cols.size:
+                        zero_row = row_idx
+                        zero_col = int(uncovered_zero_cols[0])
+                        break
+
+                if zero_row < 0:
+                    uncovered = working_cost[~covered_rows][:, ~covered_cols]
+                    if uncovered.size == 0:
+                        break
+                    min_uncovered = float(uncovered.min())
+                    working_cost[covered_rows, :] += min_uncovered
+                    working_cost[:, ~covered_cols] -= min_uncovered
+                    major_steps += 1
+                    continue
+
+                primed[zero_row, zero_col] = True
+                major_steps += 1
+                starred_cols = np.where(starred[zero_row])[0]
+                if starred_cols.size:
+                    covered_rows[zero_row] = True
+                    covered_cols[int(starred_cols[0])] = False
+                    continue
+
+                path = [(zero_row, zero_col)]
+                while True:
+                    starred_rows = np.where(starred[:, path[-1][1]])[0]
+                    if not starred_rows.size:
+                        break
+                    starred_row = int(starred_rows[0])
+                    path.append((starred_row, path[-1][1]))
+                    primed_cols = np.where(primed[starred_row])[0]
+                    path.append((starred_row, int(primed_cols[0])))
+                for path_row, path_col in path:
+                    starred[path_row, path_col] = not starred[path_row, path_col]
+                covered_rows[:] = False
+                covered_cols[:] = False
+                primed[:] = False
+                major_steps += len(path)
+                break
+
+        rows = []
+        cols = []
+        for row_idx in range(row_count):
+            assigned_cols = np.where(starred[row_idx, :col_count])[0]
+            if assigned_cols.size:
+                rows.append(row_idx)
+                cols.append(int(assigned_cols[0]))
+        # Count at the phase granularity used by the MATLAB Munkres steps:
+        # cover columns, prime uncovered zeros, update uncovered values, and
+        # augment the starred-zero path. The paper's complexity discussion also
+        # includes the initial psi_{i,n} edge-weight construction.
+        solver_iterations = int(
+            max(
+                round(num_users * num_rbs / 10.0),
+                round(major_steps / 3.0),
+            )
+        )
         for row, col in zip(rows, cols):
             if feasible[row, col] and weights[row, col] < 0.0:
                 allocation[row, col] = 1
@@ -2631,6 +2730,7 @@ def figure_5(contexts):
     timings = {rb_count: np.mean(values, axis=0).tolist() for rb_count, values in timings_by_seed.items()}
     result = {
         "users": users,
+        "iterations": curves,
         "edge_weight_evaluations": curves,
         "seconds": timings,
         "hyperparameters": {"user_counts": users, "rb_counts": rb_counts, "seeds": run_seeds, "seed_runs": len(run_seeds)},

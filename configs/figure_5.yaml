@@ -33,5 +33,5 @@ training:
 
 figures:
   figure_5:
-    user_counts: [3, 6, 9, 12, 15, 18]
+    user_counts: [3, 6, 10, 15, 20, 25]
     rb_counts: [10, 15]
