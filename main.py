@@ -3,6 +3,7 @@ import copy
 import math
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -329,6 +330,150 @@ class MNISTCNN(nn.Module):
         return self.classifier(self.features(x))
 
 
+class TrainSCG:
+    """Scaled conjugate-gradient optimizer compatible with MATLAB trainscg-style local training."""
+
+    def __init__(self, parameters, sigma, lambd, lambda_min, lambda_max, min_grad):
+        self.parameters = [parameter for parameter in parameters if parameter.requires_grad]
+        if not self.parameters:
+            raise ValueError("TrainSCG requires at least one trainable parameter")
+        self.sigma = float(sigma)
+        self.lambd = float(lambd)
+        self.lambda_min = float(lambda_min)
+        self.lambda_max = float(lambda_max)
+        self.min_grad = float(min_grad)
+        if self.sigma <= 0.0:
+            raise ValueError("training.trainscg_sigma must be positive")
+        if self.lambd <= 0.0:
+            raise ValueError("training.trainscg_lambda must be positive")
+        if self.lambda_min <= 0.0:
+            raise ValueError("training.trainscg_lambda_min must be positive")
+        if self.lambda_max < self.lambda_min:
+            raise ValueError("training.trainscg_lambda_max must be >= training.trainscg_lambda_min")
+        if self.min_grad < 0.0:
+            raise ValueError("training.trainscg_min_grad must be non-negative")
+        self.direction = None
+        self.previous_gradient = None
+        self.last_step = {}
+
+    def zero_grad(self, set_to_none=True):
+        for parameter in self.parameters:
+            if set_to_none:
+                parameter.grad = None
+            elif parameter.grad is not None:
+                parameter.grad.zero_()
+
+    def _parameters_to_vector(self):
+        return torch.cat([parameter.detach().reshape(-1) for parameter in self.parameters])
+
+    def _gradients_to_vector(self):
+        gradients = []
+        for parameter in self.parameters:
+            if parameter.grad is None:
+                gradients.append(torch.zeros_like(parameter.detach()).reshape(-1))
+            else:
+                gradients.append(parameter.grad.detach().reshape(-1))
+        return torch.cat(gradients)
+
+    def _set_parameters_from_vector(self, vector):
+        offset = 0
+        with torch.no_grad():
+            for parameter in self.parameters:
+                numel = parameter.numel()
+                parameter.copy_(vector[offset:offset + numel].view_as(parameter))
+                offset += numel
+
+    def _evaluate(self, closure):
+        with torch.enable_grad():
+            loss = closure()
+        if not torch.is_tensor(loss):
+            raise ValueError("TrainSCG closure must return a torch.Tensor loss")
+        return loss, self._gradients_to_vector()
+
+    def step(self, closure):
+        if closure is None:
+            raise ValueError("TrainSCG requires a closure")
+        loss, gradient = self._evaluate(closure)
+        gradient_norm = float(torch.linalg.vector_norm(gradient).item())
+        if gradient.numel() == 0 or gradient_norm <= self.min_grad:
+            self.last_step = {"accepted": False, "reason": "min_grad", "gradient_norm": gradient_norm, "lambda": self.lambd}
+            return loss
+
+        parameters = self._parameters_to_vector()
+        if self.direction is None or self.direction.numel() != gradient.numel():
+            direction = -gradient
+        else:
+            direction = self.direction.to(device=gradient.device, dtype=gradient.dtype)
+            if float(torch.dot(direction, gradient).item()) >= 0.0:
+                direction = -gradient
+
+        mu = torch.dot(direction, gradient)
+        if float(mu.item()) >= 0.0:
+            direction = -gradient
+            mu = torch.dot(direction, gradient)
+        kappa = torch.dot(direction, direction)
+        if float(kappa.item()) <= torch.finfo(kappa.dtype).eps:
+            self.last_step = {"accepted": False, "reason": "zero_direction", "gradient_norm": gradient_norm, "lambda": self.lambd}
+            return loss
+
+        sigma = self.sigma / torch.sqrt(kappa)
+        self._set_parameters_from_vector(parameters + sigma * direction)
+        _, gradient_plus = self._evaluate(closure)
+        self._set_parameters_from_vector(parameters)
+        loss, gradient = self._evaluate(closure)
+
+        theta = torch.dot(direction, gradient_plus - gradient) / sigma
+        delta = theta + self.lambd * kappa
+        if float(delta.item()) <= 0.0:
+            delta = self.lambd * kappa
+            self.lambd = min(self.lambda_max, self.lambd + float((-theta / kappa).item()))
+
+        alpha = -mu / delta
+        candidate = parameters + alpha * direction
+        self._set_parameters_from_vector(candidate)
+        candidate_loss, candidate_gradient = self._evaluate(closure)
+        alpha_mu = float((alpha * mu).item())
+        if alpha_mu == 0.0 or not math.isfinite(alpha_mu):
+            comparison = -math.inf
+        else:
+            comparison = 2.0 * (float(candidate_loss.detach().item()) - float(loss.detach().item())) / alpha_mu
+
+        accepted = math.isfinite(comparison) and comparison >= 0.0
+        if accepted:
+            candidate_gradient_norm = float(torch.linalg.vector_norm(candidate_gradient).item())
+            if comparison >= 0.75:
+                self.lambd = max(self.lambda_min, 0.25 * self.lambd)
+            elif comparison < 0.25:
+                damping = float((delta * (1.0 - comparison) / kappa).item())
+                self.lambd = min(self.lambda_max, self.lambd + max(damping, self.lambda_min))
+            if self.previous_gradient is None or self.previous_gradient.numel() != candidate_gradient.numel():
+                beta = torch.zeros((), dtype=candidate_gradient.dtype, device=candidate_gradient.device)
+            else:
+                previous_gradient = self.previous_gradient.to(device=candidate_gradient.device, dtype=candidate_gradient.dtype)
+                beta = torch.dot(candidate_gradient, candidate_gradient - previous_gradient) / mu
+            next_direction = -candidate_gradient + beta * direction
+            if float(torch.dot(next_direction, candidate_gradient).item()) >= 0.0:
+                next_direction = -candidate_gradient
+            self.direction = next_direction.detach()
+            self.previous_gradient = candidate_gradient.detach()
+            self.last_step = {
+                "accepted": True,
+                "comparison": comparison,
+                "gradient_norm": candidate_gradient_norm,
+                "lambda": self.lambd,
+            }
+            return candidate_loss
+
+        self._set_parameters_from_vector(parameters)
+        loss, gradient = self._evaluate(closure)
+        damping = float((delta * (1.0 - comparison) / kappa).item()) if math.isfinite(comparison) else self.lambd
+        self.lambd = min(self.lambda_max, self.lambd + max(damping, self.lambda_min))
+        self.direction = direction.detach()
+        self.previous_gradient = gradient.detach()
+        self.last_step = {"accepted": False, "comparison": comparison, "gradient_norm": gradient_norm, "lambda": self.lambd}
+        return loss
+
+
 # FL algorithms
 def fl_one_round(
     context,
@@ -365,8 +510,12 @@ def fl_one_round(
     optimizer_name = str(train_cfg.get("optimizer", "gradient_descent")).lower().replace("-", "_")
     if optimizer_name in {"gd", "full_batch_gradient_descent"}:
         optimizer_name = "gradient_descent"
-    if optimizer_name not in {"gradient_descent", "adam", "lbfgs"}:
-        raise ValueError("training.optimizer must be 'gradient_descent', 'adam', or 'lbfgs'")
+    if optimizer_name in {"stochastic_gradient_descent", "mini_batch_sgd"}:
+        optimizer_name = "sgd"
+    if optimizer_name in {"scg", "scaled_conjugate_gradient", "matlab_trainscg"}:
+        optimizer_name = "trainscg"
+    if optimizer_name not in {"gradient_descent", "sgd", "adam", "lbfgs", "trainscg"}:
+        raise ValueError("training.optimizer must be 'gradient_descent', 'sgd', 'adam', 'lbfgs', or 'trainscg'")
     learning_rate = float(
         context.learning_rate
         if context.learning_rate is not None
@@ -390,6 +539,14 @@ def fl_one_round(
         adam_eps = None
         adam_weight_decay = None
         adam_persistent_state = False
+    if optimizer_name == "sgd":
+        if "sgd_batch_size" not in train_cfg:
+            raise ValueError("training.optimizer=sgd requires explicit configs/*.yaml value for: sgd_batch_size")
+        sgd_batch_size = int(train_cfg["sgd_batch_size"])
+        if sgd_batch_size <= 0:
+            raise ValueError("training.sgd_batch_size must be positive")
+    else:
+        sgd_batch_size = None
     if optimizer_name == "lbfgs":
         lbfgs_keys = (
             "lbfgs_max_iter",
@@ -423,6 +580,28 @@ def fl_one_round(
         lbfgs_tolerance_change = None
         lbfgs_history_size = None
         lbfgs_line_search_fn = None
+    if optimizer_name == "trainscg":
+        trainscg_keys = (
+            "trainscg_sigma",
+            "trainscg_lambda",
+            "trainscg_lambda_min",
+            "trainscg_lambda_max",
+            "trainscg_min_grad",
+        )
+        missing_trainscg_keys = [key for key in trainscg_keys if key not in train_cfg]
+        if missing_trainscg_keys:
+            raise ValueError("training.optimizer=trainscg requires explicit configs/*.yaml values for: " + ", ".join(missing_trainscg_keys))
+        trainscg_sigma = float(train_cfg["trainscg_sigma"])
+        trainscg_lambda = float(train_cfg["trainscg_lambda"])
+        trainscg_lambda_min = float(train_cfg["trainscg_lambda_min"])
+        trainscg_lambda_max = float(train_cfg["trainscg_lambda_max"])
+        trainscg_min_grad = float(train_cfg["trainscg_min_grad"])
+    else:
+        trainscg_sigma = None
+        trainscg_lambda = None
+        trainscg_lambda_min = None
+        trainscg_lambda_max = None
+        trainscg_min_grad = None
     local_epochs = int(context.local_epochs)
     selected_users_array = np.asarray(selected_users, dtype=np.int64)
     assigned_rbs_array = np.asarray(assigned_rbs, dtype=np.int64)
@@ -462,12 +641,20 @@ def fl_one_round(
                 f"adam_weight_decay={adam_weight_decay:.6g} "
                 f"adam_persistent_state={adam_persistent_state}"
             )
+        if optimizer_name == "sgd":
+            verbose_print(f"[fl_one_round][{scheme_label}] sgd_batch_size={sgd_batch_size}")
         if optimizer_name == "lbfgs":
             verbose_print(
                 f"[fl_one_round][{scheme_label}] lbfgs_max_iter={lbfgs_max_iter} "
                 f"lbfgs_max_eval={lbfgs_max_eval} lbfgs_tolerance_grad={lbfgs_tolerance_grad:.6g} "
                 f"lbfgs_tolerance_change={lbfgs_tolerance_change:.6g} "
                 f"lbfgs_history_size={lbfgs_history_size} lbfgs_line_search_fn={lbfgs_line_search_fn}"
+            )
+        if optimizer_name == "trainscg":
+            verbose_print(
+                f"[fl_one_round][{scheme_label}] trainscg_sigma={trainscg_sigma:.6g} "
+                f"trainscg_lambda={trainscg_lambda:.6g} trainscg_lambda_min={trainscg_lambda_min:.6g} "
+                f"trainscg_lambda_max={trainscg_lambda_max:.6g} trainscg_min_grad={trainscg_min_grad:.6g}"
             )
         if selected_users_array.size:
             verbose_print(
@@ -493,6 +680,8 @@ def fl_one_round(
             )
             if adam_persistent_state and int(user_idx) in context.optimizer_states:
                 optimizer.load_state_dict(context.optimizer_states[int(user_idx)])
+        elif optimizer_name == "sgd":
+            optimizer = torch.optim.SGD(local_model.parameters(), lr=learning_rate)
         elif optimizer_name == "lbfgs":
             optimizer = torch.optim.LBFGS(
                 local_model.parameters(),
@@ -504,10 +693,30 @@ def fl_one_round(
                 history_size=lbfgs_history_size,
                 line_search_fn=lbfgs_line_search_fn,
             )
+        elif optimizer_name == "trainscg":
+            optimizer = TrainSCG(
+                local_model.parameters(),
+                sigma=trainscg_sigma,
+                lambd=trainscg_lambda,
+                lambda_min=trainscg_lambda_min,
+                lambda_max=trainscg_lambda_max,
+                min_grad=trainscg_min_grad,
+            )
         else:
             optimizer = None
         user_data = context.partitions[int(user_idx)]
-        loader = DataLoader(user_data, batch_size=len(user_data), shuffle=False)
+        if optimizer_name == "sgd":
+            loader_seed = int(context.seed or 0) * 1000003 + int(round_index) * 9176 + int(user_idx)
+            loader_generator = torch.Generator()
+            loader_generator.manual_seed(loader_seed)
+            loader = DataLoader(
+                user_data,
+                batch_size=min(sgd_batch_size, len(user_data)),
+                shuffle=True,
+                generator=loader_generator,
+            )
+        else:
+            loader = DataLoader(user_data, batch_size=len(user_data), shuffle=False)
         local_state_before = None
         if verbose:
             power = powers_matrix[int(user_idx), int(rb_idx)] if powers_matrix is not None else None
@@ -549,7 +758,7 @@ def fl_one_round(
                         return error.pow(2).mean()
                     return loss_fn(prediction, labels.long())
 
-                if optimizer_name == "lbfgs":
+                if optimizer_name in {"lbfgs", "trainscg"}:
                     def closure():
                         optimizer.zero_grad(set_to_none=True)
                         closure_loss = local_loss()
@@ -573,15 +782,18 @@ def fl_one_round(
                         for parameter in local_model.parameters():
                             if parameter.grad is not None:
                                 parameter.add_(parameter.grad, alpha=-learning_rate)
-                elif optimizer_name == "adam":
+                elif optimizer_name in {"adam", "sgd"}:
                     optimizer.step()
                 if verbose:
                     grad_norm = math.sqrt(grad_norm_sq)
+                    extra_optimizer_text = ""
+                    if optimizer_name == "trainscg":
+                        extra_optimizer_text = f" trainscg_step={optimizer.last_step}"
                     verbose_print(
                         f"[fl_one_round][{scheme_label}] user={int(user_idx)} "
                         f"epoch={local_epoch + 1}/{local_epochs} batch={batch_index + 1} "
                         f"batch_samples={len(features)} local_loss={float(loss.item()):.9g} "
-                        f"grad_norm={grad_norm:.9g}"
+                        f"grad_norm={grad_norm:.9g}{extra_optimizer_text}"
                     )
         if verbose and local_state_before is not None:
             local_state_after = {name: value.detach().cpu() for name, value in local_model.state_dict().items()}
@@ -668,6 +880,13 @@ def baseline_a(
     wireless = cfg["wireless"]
     train_cfg = cfg["training"]
     verbose = bool(verbose or cfg["_verbose"])
+    baseline_a_mode = str(train_cfg["baseline_a_mode"]).lower().replace("-", "_")
+    if baseline_a_mode in {"current", "legacy", "old", "collision", "random_user_rbs"}:
+        baseline_a_mode = "legacy_collision"
+    if baseline_a_mode in {"paper", "matching", "random_feasible_matching"}:
+        baseline_a_mode = "random_matching"
+    if baseline_a_mode not in {"random_matching", "legacy_collision"}:
+        raise ValueError("training.baseline_a_mode must be 'random_matching' or 'legacy_collision'")
     if context is not None:
         partitions = context.partitions
         test_data = context.test_data
@@ -837,23 +1056,44 @@ def baseline_a(
             energies[user_idx, rb_idx] = energy
             feasible[user_idx, rb_idx] = total_delays[user_idx, rb_idx] <= gamma_t and energy <= gamma_e
 
-    # Baseline a keeps the FL-aware user set, then randomizes RB assignment.
-    weights = np.where(feasible, counts[:, None] * (packet_errors - 1.0), 0.0)
-    assignment_users = []
-    rows, cols = linear_sum_assignment(weights)
-    for row, col in zip(rows, cols):
-        if feasible[row, col] and weights[row, col] < 0.0:
-            assignment_users.append(int(row))
-
     allocation = np.zeros((num_users, num_rbs), dtype=np.int64)
     selected_users = []
     assigned_rbs = []
-    random_rbs = rng.permutation(num_rbs)[:len(assignment_users)]
-    for user_idx, rb_idx in zip(assignment_users, random_rbs):
-        allocation[user_idx, rb_idx] = 1
-        selected_users.append(user_idx)
-        assigned_rbs.append(int(rb_idx))
-    solver_iterations = int(num_users * num_rbs)
+    if baseline_a_mode == "legacy_collision":
+        # Legacy mode: each user independently draws one RB, then each RB keeps its best candidate.
+        random_user_rbs = rng.integers(0, num_rbs, size=num_users)
+        selection_values = np.full(num_users, -np.inf, dtype=np.float64)
+        for user_idx, rb_idx in enumerate(random_user_rbs):
+            if feasible[user_idx, rb_idx]:
+                selection_values[user_idx] = counts[user_idx] * (1.0 - packet_errors[user_idx, rb_idx])
+        for rb_idx in range(num_rbs):
+            candidate_users = np.flatnonzero(random_user_rbs == rb_idx)
+            if candidate_users.size == 0:
+                continue
+            best_user = int(candidate_users[np.argmax(selection_values[candidate_users])])
+            if math.isfinite(float(selection_values[best_user])) and selection_values[best_user] > 0.0:
+                allocation[best_user, rb_idx] = 1
+                selected_users.append(best_user)
+                assigned_rbs.append(int(rb_idx))
+    else:
+        # Paper-oriented mode: draw a random feasible one-to-one user/RB matching, then
+        # keep the matched clients that improve the FL-aware objective Ki * (1 - q_i,n).
+        matched_edges = []
+        unmatched_users = set(range(num_users))
+        for rb_idx in rng.permutation(num_rbs):
+            feasible_users = [user_idx for user_idx in unmatched_users if feasible[user_idx, rb_idx]]
+            if not feasible_users:
+                continue
+            user_idx = int(feasible_users[int(rng.integers(0, len(feasible_users)))])
+            unmatched_users.remove(user_idx)
+            matched_edges.append((user_idx, int(rb_idx)))
+        matched_edges.sort(key=lambda edge: counts[edge[0]] * (1.0 - packet_errors[edge[0], edge[1]]), reverse=True)
+        for user_idx, rb_idx in matched_edges:
+            if counts[user_idx] * (1.0 - packet_errors[user_idx, rb_idx]) > 0.0:
+                allocation[user_idx, rb_idx] = 1
+                selected_users.append(int(user_idx))
+                assigned_rbs.append(int(rb_idx))
+    solver_iterations = int(num_users)
     selected_users = np.array(selected_users, dtype=np.int64)
     assigned_rbs = np.array(assigned_rbs, dtype=np.int64)
     selected_errors = np.array(
@@ -965,6 +1205,7 @@ def baseline_a(
 
     return {
         "scheme": "baseline_a",
+        "baseline_a_mode": baseline_a_mode,
         "allocation": allocation,
         "selected_users": selected_users,
         "assigned_rbs": assigned_rbs,
@@ -1199,6 +1440,10 @@ def baseline_b(
 
     metrics = {"loss": [], "accuracy": [], "successful_users": []}
     trained_state = None
+    best_model_state = None
+    best_round = None
+    best_loss = None
+    best_accuracy = None
     if rounds > 0 and partitions is not None:
         # Training is identical to proposed FL once the random wireless assignment is fixed.
         device_name = device or train_cfg["device"]
@@ -1291,6 +1536,21 @@ def baseline_b(
                 metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
+            current_loss = metrics["loss"][-1]
+            current_accuracy = metrics["accuracy"][-1]
+            if task == "regression":
+                is_best = best_loss is None or current_loss < best_loss
+            else:
+                is_best = (
+                    best_accuracy is None
+                    or current_accuracy > best_accuracy
+                    or (current_accuracy == best_accuracy and (best_loss is None or current_loss < best_loss))
+                )
+            if is_best:
+                best_model_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
+                best_round = round_index + 1
+                best_loss = current_loss
+                best_accuracy = current_accuracy
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
 
     return {
@@ -1311,6 +1571,10 @@ def baseline_b(
         "solver_iterations": solver_iterations,
         "metrics": metrics,
         "model_state": trained_state,
+        "best_model_state": best_model_state,
+        "best_round": best_round,
+        "best_loss": best_loss,
+        "best_accuracy": best_accuracy,
         "wireless": {
             "distances": distances,
             "channel_gain": channel_gain,
@@ -1524,10 +1788,11 @@ def baseline_c(
                 assigned_rbs.append(int(col))
     else:
         # docs/Wireless-FL/FLMIN.m baseline 3:
-        # Munkres selects the users from W=q, then qassignment is randomized.
+        # W starts at zero and only feasible edges receive q, matching the MATLAB code.
+        # Munkres selects users from W, then qassignment is randomized.
         weights = np.zeros((num_users, num_rbs), dtype=np.float64)
         weights[feasible] = packet_errors[feasible]
-        rows, _cols = linear_sum_assignment(weights)
+        rows, cols = linear_sum_assignment(weights)
         selected_users = [int(row) for row in rows]
         random_rbs = rng.permutation(num_rbs)[:len(selected_users)]
         for user_idx, rb_idx in zip(selected_users, random_rbs):
@@ -2063,6 +2328,10 @@ def proposed_algorithm(
 
     metrics = {"loss": [], "accuracy": [], "successful_users": []}
     trained_state = None
+    best_model_state = None
+    best_round = None
+    best_loss = None
+    best_accuracy = None
     if rounds > 0 and partitions is not None:
         # After assignment, FL training differs only through packet success draws.
         device_name = device or train_cfg["device"]
@@ -2155,6 +2424,21 @@ def proposed_algorithm(
                 metrics["loss"].append(eval_loss / max(eval_total, 1))
             metrics["accuracy"].append(eval_correct / max(eval_total, 1) if task != "regression" else float("nan"))
             metrics["successful_users"].append(successes)
+            current_loss = metrics["loss"][-1]
+            current_accuracy = metrics["accuracy"][-1]
+            if task == "regression":
+                is_best = best_loss is None or current_loss < best_loss
+            else:
+                is_best = (
+                    best_accuracy is None
+                    or current_accuracy > best_accuracy
+                    or (current_accuracy == best_accuracy and (best_loss is None or current_loss < best_loss))
+                )
+            if is_best:
+                best_model_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
+                best_round = round_index + 1
+                best_loss = current_loss
+                best_accuracy = current_accuracy
         trained_state = {name: value.detach().cpu().clone() for name, value in global_model.state_dict().items()}
 
     return {
@@ -2177,6 +2461,10 @@ def proposed_algorithm(
         "solver_iteration_components": solver_iteration_components,
         "metrics": metrics,
         "model_state": trained_state,
+        "best_model_state": best_model_state,
+        "best_round": best_round,
+        "best_loss": best_loss,
+        "best_accuracy": best_accuracy,
         "wireless": {
             "distances": distances,
             "channel_gain": channel_gain,
@@ -2196,8 +2484,28 @@ def build_contexts(path=None) -> list[Context]:
     if not path.exists():
         raise FileNotFoundError(f"Configuration file is required for non-paper parameters: {path}")
 
+    common_override = {}
+    common_path = path.parent / "common.yaml"
+    if path.name != "common.yaml" and common_path.exists():
+        with open(common_path, "r", encoding="utf-8") as handle:
+            common_override = yaml.safe_load(handle) or {}
+        if not isinstance(common_override, dict):
+            raise ValueError(f"Common configuration must be a mapping: {common_path}")
+
     with open(path, "r", encoding="utf-8") as handle:
-        override = yaml.safe_load(handle) or {}
+        file_override = yaml.safe_load(handle) or {}
+    if not isinstance(file_override, dict):
+        raise ValueError(f"Configuration must be a mapping: {path}")
+
+    override = copy.deepcopy(common_override)
+    stack = [(override, file_override)]
+    while stack:
+        base, update = stack.pop()
+        for key, value in update.items():
+            if isinstance(value, dict) and key in base and isinstance(base[key], dict):
+                stack.append((base[key], value))
+            else:
+                base[key] = value
 
     required_yaml_keys = {
         "wireless": [
@@ -2216,7 +2524,10 @@ def build_contexts(path=None) -> list[Context]:
             "heuristic_max_rbs",
         ],
         "training": [
+            "baseline_a_mode",
             "baseline_c_mode",
+            "optimizer",
+            "sgd_batch_size",
             "quantization_bits",
             "eval_batch_size",
             "mnist_activation",
@@ -2238,6 +2549,24 @@ def build_contexts(path=None) -> list[Context]:
                 missing.append(f"{section_name}.{key}")
     if missing:
         raise ValueError("configs/*.yaml must explicitly provide non-paper parameters: " + ", ".join(missing))
+    optimizer_values = override.get("training", {}).get("optimizer", [])
+    if not isinstance(optimizer_values, list):
+        optimizer_values = [optimizer_values]
+    normalized_optimizers = {str(value).lower().replace("-", "_") for value in optimizer_values}
+    if normalized_optimizers & {"trainscg", "scg", "scaled_conjugate_gradient", "matlab_trainscg"}:
+        trainscg_keys = (
+            "trainscg_sigma",
+            "trainscg_lambda",
+            "trainscg_lambda_min",
+            "trainscg_lambda_max",
+            "trainscg_min_grad",
+        )
+        missing_trainscg = [f"training.{key}" for key in trainscg_keys if key not in override.get("training", {})]
+        if missing_trainscg:
+            raise ValueError(
+                "configs/*.yaml must explicitly provide non-paper trainscg parameters: "
+                + ", ".join(missing_trainscg)
+            )
 
     # Defaults encode paper/Table-II parameters; YAML supplies non-paper sweep choices.
     config = {
@@ -2273,8 +2602,10 @@ def build_contexts(path=None) -> list[Context]:
         },
         "training": {
             "device": "auto",
+            "baseline_a_mode": "random_matching",
             "baseline_c_mode": "current",
             "optimizer": "gradient_descent",
+            "sgd_batch_size": 32,
             "quantization_bits": 16,
             "eval_batch_size": 256,
             "mnist_activation": "relu",
@@ -2348,7 +2679,7 @@ def build_contexts(path=None) -> list[Context]:
             },
             "figure_10": {
                 "samples_per_user": 2000,
-                "test_samples": 10000,
+                "test_samples": 36,
                 "rounds": 130,
                 "num_rbs": 12,
                 "local_epochs": 1,
@@ -2473,6 +2804,13 @@ def figure_3(contexts):
     local_epochs = int(first_candidate(figure_cfg["local_epochs"]))
     activation = str(first_candidate(figure_cfg["activation"]))
     learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
+    optimizer_name = str(first_candidate(cfg["training"]["optimizer"])).lower().replace("-", "_")
+    if optimizer_name in {"gd", "full_batch_gradient_descent"}:
+        optimizer_name = "gradient_descent"
+    if optimizer_name in {"stochastic_gradient_descent", "mini_batch_sgd"}:
+        optimizer_name = "sgd"
+    if optimizer_name in {"scg", "scaled_conjugate_gradient", "matlab_trainscg"}:
+        optimizer_name = "trainscg"
     regression_loss = str(first_candidate(cfg["training"]["regression_loss"])).lower()
     quantization_bits = int(first_candidate(cfg["training"]["quantization_bits"]))
     if quantization_bits == 16:
@@ -2502,7 +2840,7 @@ def figure_3(contexts):
             "rounds": rounds,
             "num_rbs": num_rbs,
             "local_epochs": local_epochs,
-            "optimizer": "full_batch_gradient_descent",
+            "optimizer": optimizer_name,
             "activation": activation,
             "learning_rate": learning_rate,
             "quantization_bits": quantization_bits,
@@ -2511,6 +2849,8 @@ def figure_3(contexts):
             "optimal_resource_search": "heuristic",
         }
     }
+    if optimizer_name == "sgd":
+        result["hyperparameters"]["sgd_batch_size"] = int(first_candidate(cfg["training"]["sgd_batch_size"]))
     torch.manual_seed(seed)
     initial_model = RegressionFNN(activation=activation)
     initial_state = {name: value.detach().clone() for name, value in initial_model.state_dict().items()}
@@ -2616,6 +2956,13 @@ def figure_4(contexts):
     activation = str(first_candidate(figure_cfg["activation"]))
     noise_std = 0.4
     learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
+    optimizer_name = str(first_candidate(cfg["training"]["optimizer"])).lower().replace("-", "_")
+    if optimizer_name in {"gd", "full_batch_gradient_descent"}:
+        optimizer_name = "gradient_descent"
+    if optimizer_name in {"stochastic_gradient_descent", "mini_batch_sgd"}:
+        optimizer_name = "sgd"
+    if optimizer_name in {"scg", "scaled_conjugate_gradient", "matlab_trainscg"}:
+        optimizer_name = "trainscg"
     eval_batch_size = int(first_candidate(cfg["training"]["eval_batch_size"]))
     regression_loss = str(first_candidate(cfg["training"]["regression_loss"])).lower()
     quantization_bits = int(first_candidate(cfg["training"]["quantization_bits"]))
@@ -2686,7 +3033,7 @@ def figure_4(contexts):
             "rounds": rounds,
             "num_rbs": num_rbs,
             "local_epochs": local_epochs,
-            "optimizer": "full_batch_gradient_descent",
+            "optimizer": optimizer_name,
             "activation": activation,
             "noise_std": noise_std,
             "learning_rate": learning_rate,
@@ -2701,6 +3048,8 @@ def figure_4(contexts):
             "seed_runs": len(run_seeds),
         },
     }
+    if optimizer_name == "sgd":
+        result["hyperparameters"]["sgd_batch_size"] = int(first_candidate(cfg["training"]["sgd_batch_size"]))
     if plot:
         fig, ax = plt.subplots()
         ax.plot(sample_counts, curves["proposed"], color="blue", marker="o", linewidth=2.5, label="Proposed algorithm")
@@ -3023,6 +3372,10 @@ def figure_7(contexts):
     optimizer_name = str(cfg["training"].get("optimizer", "gradient_descent")).lower().replace("-", "_")
     if optimizer_name in {"gd", "full_batch_gradient_descent"}:
         optimizer_name = "gradient_descent"
+    if optimizer_name in {"stochastic_gradient_descent", "mini_batch_sgd"}:
+        optimizer_name = "sgd"
+    if optimizer_name in {"scg", "scaled_conjugate_gradient", "matlab_trainscg"}:
+        optimizer_name = "trainscg"
     run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     curves = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
@@ -3063,8 +3416,11 @@ def figure_7(contexts):
         "compute_dtype": str(compute_dtype).replace("torch.", ""),
         "seeds": run_seeds,
         "seed_runs": len(run_seeds),
+        "baseline_a_mode": cfg["training"]["baseline_a_mode"],
         "baseline_c_mode": cfg["training"]["baseline_c_mode"],
     }
+    if optimizer_name == "sgd":
+        hyperparameters.update({"sgd_batch_size": int(cfg["training"]["sgd_batch_size"])})
     if optimizer_name == "adam":
         hyperparameters.update(
             {
@@ -3084,6 +3440,16 @@ def figure_7(contexts):
                 "lbfgs_tolerance_change": float(cfg["training"]["lbfgs_tolerance_change"]),
                 "lbfgs_history_size": int(cfg["training"]["lbfgs_history_size"]),
                 "lbfgs_line_search_fn": cfg["training"]["lbfgs_line_search_fn"],
+            }
+        )
+    if optimizer_name == "trainscg":
+        hyperparameters.update(
+            {
+                "trainscg_sigma": float(cfg["training"]["trainscg_sigma"]),
+                "trainscg_lambda": float(cfg["training"]["trainscg_lambda"]),
+                "trainscg_lambda_min": float(cfg["training"]["trainscg_lambda_min"]),
+                "trainscg_lambda_max": float(cfg["training"]["trainscg_lambda_max"]),
+                "trainscg_min_grad": float(cfg["training"]["trainscg_min_grad"]),
             }
         )
     result = {
@@ -3146,6 +3512,13 @@ def figure_8(contexts):
     num_rbs = int(first_candidate(figure_cfg["num_rbs"]))
     local_epochs = int(first_candidate(figure_cfg["local_epochs"]))
     learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
+    optimizer_name = str(first_candidate(cfg["training"]["optimizer"])).lower().replace("-", "_")
+    if optimizer_name in {"gd", "full_batch_gradient_descent"}:
+        optimizer_name = "gradient_descent"
+    if optimizer_name in {"stochastic_gradient_descent", "mini_batch_sgd"}:
+        optimizer_name = "sgd"
+    if optimizer_name in {"scg", "scaled_conjugate_gradient", "matlab_trainscg"}:
+        optimizer_name = "trainscg"
     run_seeds = [int(value) for value in cfg["_run_seeds"]]
 
     curves_by_seed = {"proposed": [], "baseline_a": [], "baseline_b": [], "baseline_c": []}
@@ -3198,13 +3571,16 @@ def figure_8(contexts):
             "rounds": rounds,
             "num_rbs": num_rbs,
             "local_epochs": local_epochs,
-            "optimizer": "full_batch_gradient_descent",
+            "optimizer": optimizer_name,
             "learning_rate": learning_rate,
             "seeds": run_seeds,
             "seed_runs": len(run_seeds),
+            "baseline_a_mode": cfg["training"]["baseline_a_mode"],
             "baseline_c_mode": cfg["training"]["baseline_c_mode"],
         },
     }
+    if optimizer_name == "sgd":
+        result["hyperparameters"]["sgd_batch_size"] = int(cfg["training"]["sgd_batch_size"])
     if plot:
         fig, ax = plt.subplots()
         ax.plot(user_counts, curves["proposed"], color="black", linewidth=2.0, label="Proposed FL")
@@ -3258,6 +3634,13 @@ def figure_9(contexts):
     rounds = int(first_candidate(figure_cfg["rounds"]))
     local_epochs = int(first_candidate(figure_cfg["local_epochs"]))
     learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
+    optimizer_name = str(first_candidate(cfg["training"]["optimizer"])).lower().replace("-", "_")
+    if optimizer_name in {"gd", "full_batch_gradient_descent"}:
+        optimizer_name = "gradient_descent"
+    if optimizer_name in {"stochastic_gradient_descent", "mini_batch_sgd"}:
+        optimizer_name = "sgd"
+    if optimizer_name in {"scg", "scaled_conjugate_gradient", "matlab_trainscg"}:
+        optimizer_name = "trainscg"
     runner_seed_mode = str(first_candidate(figure_cfg["runner_seed_mode"])).lower()
     if runner_seed_mode not in {"same", "rb_offset"}:
         raise ValueError("figure_9.runner_seed_mode must be 'same' or 'rb_offset'")
@@ -3303,11 +3686,12 @@ def figure_9(contexts):
             "test_samples": test_samples,
             "rounds": rounds,
             "local_epochs": local_epochs,
-            "optimizer": "full_batch_gradient_descent",
+            "optimizer": optimizer_name,
             "learning_rate": learning_rate,
             "runner_seed_mode": runner_seed_mode,
             "seeds": run_seeds,
             "seed_runs": len(run_seeds),
+            "baseline_a_mode": cfg["training"]["baseline_a_mode"],
             "baseline_c_mode": cfg["training"]["baseline_c_mode"],
             "baseline_c_assignment": "wireless_fl_munkres_then_random_rb" if str(cfg["training"]["baseline_c_mode"]).lower() == "wireless_fl" else "ki_agnostic_hungarian",
             "baseline_c_aggregation": "fedavg",
@@ -3318,6 +3702,8 @@ def figure_9(contexts):
             "force_first_round_success": cfg["training"]["force_first_round_success"],
         },
     }
+    if optimizer_name == "sgd":
+        result["hyperparameters"]["sgd_batch_size"] = int(cfg["training"]["sgd_batch_size"])
     if plot:
         fig, ax = plt.subplots()
         ax.plot(rb_counts, curves["proposed"], color="black", linewidth=2.0, label="Proposed FL")
@@ -3359,6 +3745,13 @@ def figure_10(contexts):
     num_rbs = int(first_candidate(figure_cfg["num_rbs"]))
     local_epochs = int(first_candidate(figure_cfg["local_epochs"]))
     learning_rate = float(first_candidate(figure_cfg["learning_rate"]))
+    optimizer_name = str(first_candidate(cfg["training"]["optimizer"])).lower().replace("-", "_")
+    if optimizer_name in {"gd", "full_batch_gradient_descent"}:
+        optimizer_name = "gradient_descent"
+    if optimizer_name in {"stochastic_gradient_descent", "mini_batch_sgd"}:
+        optimizer_name = "sgd"
+    if optimizer_name in {"scg", "scaled_conjugate_gradient", "matlab_trainscg"}:
+        optimizer_name = "trainscg"
     data = load_mnist_data(
         num_users=15,
         samples_per_user=samples_per_user,
@@ -3367,6 +3760,8 @@ def figure_10(contexts):
         train_order=cfg["training"]["mnist_train_order"],
         partition_order=cfg["training"]["mnist_partition_order"],
     )
+    if len(data["test"]) != 36:
+        raise ValueError("Fig. 10 must evaluate exactly 36 MNIST samples")
     torch.manual_seed(seed)
     initial_model = MNISTCNN()
     initial_state = {name: value.detach().clone() for name, value in initial_model.state_dict().items()}
@@ -3398,30 +3793,42 @@ def figure_10(contexts):
         seed=seed,
         config=cfg,
     )
+    images, labels = data["test"].tensors
+    proposed_state = proposed["best_model_state"] if proposed.get("best_model_state") is not None else proposed["model_state"]
+    baseline_state = baseline["best_model_state"] if baseline.get("best_model_state") is not None else baseline["model_state"]
+    proposed_model = MNISTCNN()
+    proposed_model.load_state_dict(proposed_state)
+    baseline_model = MNISTCNN()
+    baseline_model.load_state_dict(baseline_state)
+    proposed_model.eval()
+    baseline_model.eval()
+    with torch.no_grad():
+        proposed_predictions = proposed_model(images).argmax(dim=1)
+        baseline_predictions = baseline_model(images).argmax(dim=1)
+    proposed_correct = int((proposed_predictions == labels).sum().item())
+    baseline_correct = int((baseline_predictions == labels).sum().item())
+    n_examples = len(data["test"])
     result = {
-        "proposed_accuracy": proposed["metrics"]["accuracy"][-1],
-        "baseline_b_accuracy": baseline["metrics"]["accuracy"][-1],
-        "proposed_correct": int(round(proposed["metrics"]["accuracy"][-1] * len(data["test"]))),
-        "baseline_b_correct": int(round(baseline["metrics"]["accuracy"][-1] * len(data["test"]))),
-        "n_examples": len(data["test"]),
+        "proposed_accuracy": proposed_correct / max(n_examples, 1),
+        "baseline_b_accuracy": baseline_correct / max(n_examples, 1),
+        "proposed_correct": proposed_correct,
+        "baseline_b_correct": baseline_correct,
+        "proposed_best_round": proposed["best_round"],
+        "baseline_b_best_round": baseline["best_round"],
+        "n_examples": n_examples,
         "hyperparameters": {
             "samples_per_user": samples_per_user,
             "test_samples": test_samples,
             "rounds": rounds,
             "num_rbs": num_rbs,
             "local_epochs": local_epochs,
+            "optimizer": optimizer_name,
             "learning_rate": learning_rate,
         },
     }
+    if optimizer_name == "sgd":
+        result["hyperparameters"]["sgd_batch_size"] = int(cfg["training"]["sgd_batch_size"])
     if plot:
-        images, labels = data["test"].tensors
-        proposed_model = MNISTCNN()
-        proposed_model.load_state_dict(proposed["model_state"])
-        baseline_model = MNISTCNN()
-        baseline_model.load_state_dict(baseline["model_state"])
-        with torch.no_grad():
-            proposed_predictions = proposed_model(images).argmax(dim=1)
-            baseline_predictions = baseline_model(images).argmax(dim=1)
         fig, axes = plt.subplots(6, 6, figsize=(7, 7))
         for idx, ax in enumerate(axes.ravel()):
             ax.imshow(images[idx, 0], cmap="gray")
@@ -3545,45 +3952,125 @@ def main():
         else:
             fig.tight_layout()
 
+    def to_builtin(value):
+        if torch.is_tensor(value):
+            detached = value.detach().cpu()
+            return {
+                "shape": list(detached.shape),
+                "first": float(detached.reshape(-1)[0].item()) if detached.numel() else None,
+            }
+        if isinstance(value, dict):
+            return {str(key): to_builtin(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [to_builtin(item) for item in value]
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, Path):
+            return str(value)
+        return value
+
     planned = {name: contexts_for_figure(name) for name in selected}
     total_runs = sum(len(contexts) for contexts in planned.values())
     print(f"planned_runs: {total_runs}")
     if total_runs >= 100:
         print(f"warning: YAML expands to {total_runs} runs; narrow candidate lists if this is unintended.")
 
-    for name, func in selected.items():
-        contexts = planned[name]
-        result = func(contexts)
-        save_path = None
-        if "figure" in result:
-            fig = result["figure"]
-            format_figure(fig, name)
-            save_dir = output_dir / f"figure_{name}"
-            save_dir.mkdir(parents=True, exist_ok=True)
-            save_path = save_dir / f"001_contexts_{len(contexts)}.png"
-            fig.savefig(save_path, dpi=200, bbox_inches="tight")
-            plt.close(fig)
+    merge_axis_keys_by_figure = {
+        "4": {"sample_counts"},
+        "5": {"user_counts", "rb_counts"},
+        "6": {"user_counts"},
+        "8": {"user_counts"},
+        "9": {"rb_counts"},
+    }
+    seed_averaged_figures = {"4", "5", "6", "7", "8", "9"}
 
-        printable = {"context_count": len(contexts)}
-        for key, value in result.items():
-            if key == "figure":
-                continue
-            if isinstance(value, np.ndarray):
-                printable[key] = {"shape": value.shape, "first": float(value.ravel()[0]) if value.size else None}
-            elif isinstance(value, tuple) and value and all(isinstance(item, np.ndarray) for item in value):
-                printable[key] = [{"shape": item.shape, "first": float(item.ravel()[0]) if item.size else None} for item in value]
-            elif isinstance(value, dict):
-                printable[key] = {}
-                for subkey, subvalue in value.items():
-                    if key == "loss" and isinstance(subvalue, list) and subvalue:
-                        printable[key][subkey] = subvalue[-1]
-                    else:
-                        printable[key][subkey] = subvalue
-            else:
-                printable[key] = value
-        print(f"figure_{name}: {printable}")
-        if save_path is not None:
-            print(f"saved: {save_path}")
+    for name, func in selected.items():
+        config_path = Path(args.config) if args.config is not None else Path("configs") / f"figure_{name}.yaml"
+        contexts = planned[name]
+        merge_axis_keys = merge_axis_keys_by_figure.get(name, set())
+        grouped_contexts = {}
+        for context in contexts:
+            varied = context.loss.get("_varied", {})
+            group_varied = {}
+            for key in sorted(varied):
+                if key in merge_axis_keys:
+                    continue
+                if name in seed_averaged_figures and key == "seed":
+                    continue
+                group_varied[key] = varied[key]
+            group_key = tuple((key, value_token(value)) for key, value in group_varied.items())
+            if group_key not in grouped_contexts:
+                grouped_contexts[group_key] = {"contexts": [], "varied": group_varied}
+            grouped_contexts[group_key]["contexts"].append(context)
+
+        if len(grouped_contexts) > 1:
+            context_groups = []
+            for group_key in sorted(grouped_contexts):
+                group = grouped_contexts[group_key]
+                context_groups.append((run_token(group["varied"]), group["contexts"], group["varied"]))
+        else:
+            group_key = next(iter(grouped_contexts))
+            group = grouped_contexts[group_key]
+            context_groups = [("contexts", group["contexts"], {})]
+
+        for group_index, (group_token, group_contexts, group_varied) in enumerate(context_groups, start=1):
+            result = func(group_contexts)
+            save_path = None
+            settings_path = None
+            save_time = datetime.now()
+            if "figure" in result:
+                fig = result["figure"]
+                format_figure(fig, name)
+                save_dir = output_dir / f"figure_{name}"
+                save_dir.mkdir(parents=True, exist_ok=True)
+                save_token = save_time.strftime("%Y%m%d_%H%M%S_%f")
+                save_path = save_dir / f"{save_token}.png"
+                settings_path = save_dir / f"{save_token}.yaml"
+                fig.savefig(save_path, dpi=200, bbox_inches="tight")
+                plt.close(fig)
+
+            printable = {"context_count": len(group_contexts)}
+            if group_varied:
+                printable["group"] = group_varied
+            for key, value in result.items():
+                if key == "figure":
+                    continue
+                if isinstance(value, np.ndarray):
+                    printable[key] = {"shape": value.shape, "first": float(value.ravel()[0]) if value.size else None}
+                elif isinstance(value, tuple) and value and all(isinstance(item, np.ndarray) for item in value):
+                    printable[key] = [{"shape": item.shape, "first": float(item.ravel()[0]) if item.size else None} for item in value]
+                elif isinstance(value, dict):
+                    printable[key] = {}
+                    for subkey, subvalue in value.items():
+                        if key == "loss" and isinstance(subvalue, list) and subvalue:
+                            printable[key][subkey] = subvalue[-1]
+                        else:
+                            printable[key][subkey] = subvalue
+                else:
+                    printable[key] = value
+            if settings_path is not None:
+                settings_payload = {
+                    "figure": f"figure_{name}",
+                    "generated_at": save_time.isoformat(timespec="microseconds"),
+                    "config_path": str(config_path),
+                    "output_png": str(save_path),
+                    "context_count": len(group_contexts),
+                    "group_index": group_index,
+                    "group_token": group_token,
+                    "group": group_varied,
+                    "hyperparameters": result.get("hyperparameters", {}),
+                    "summary": printable,
+                    "contexts": [context.loss for context in group_contexts],
+                }
+                with open(settings_path, "w", encoding="utf-8") as handle:
+                    yaml.safe_dump(to_builtin(settings_payload), handle, sort_keys=False, allow_unicode=True)
+            label = f"figure_{name}" if len(context_groups) == 1 else f"figure_{name}[{group_token}]"
+            print(f"{label}: {printable}")
+            if save_path is not None:
+                print(f"saved: {save_path}")
+                print(f"settings: {settings_path}")
 
 
 if __name__ == "__main__":

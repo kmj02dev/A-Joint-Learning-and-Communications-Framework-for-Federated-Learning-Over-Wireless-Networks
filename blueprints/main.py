@@ -89,7 +89,7 @@ def load_mnist_data():
 def get_partitioned_data():
     pass
 
-# models
+# models, optimizers
 class RegressionFNN:
     pass
 
@@ -97,6 +97,9 @@ class MNISTFNN:
     pass
 
 class MNISTCNN:
+    pass
+
+class TrainSCG:
     pass
 
 # FL algorithms
@@ -116,7 +119,7 @@ def fl_one_round(
     pass
 
 def baseline_a(context, verbose=False):
-    """FL-aware user selection + random RB allocation"""
+    """FL-aware user selection + random RB allocation; mode is selected by training.baseline_a_mode."""
 
 def baseline_b(context, verbose=False):
     """random user selection + random RB allocation"""
